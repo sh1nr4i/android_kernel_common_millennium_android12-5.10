@@ -3046,11 +3046,11 @@ static struct binder_node *binder_get_node_refs_for_txn(
 #define FP_BACKOFF_MAX_MS	16000
 
 struct binder_fp_slot {
-	pid_t		tgid;
+	pid_t		tid;
 	unsigned long	win_start;	/* start of current 1-s window */
 	unsigned long	last_query;	/* last query jiffies */
 	u8		win_count;	/* queries this window */
-	u8		backoff_level;	/* 0=none, n=sleep 2^(n-1)*MIN */
+	u8		backoff_level;	/* 0=none, 1=throttled */
 };
 
 static struct binder_fp_slot binder_fp_slots[FP_SLOTS];
@@ -3058,17 +3058,19 @@ static DEFINE_SPINLOCK(binder_fp_lock);
 
 /*
  * Returns sleep duration in ms (0 = pass through immediately).
+ * Tracks by calling Thread ID (current->pid) so that only the runaway
+ * background thread is throttled, leaving all other threads in the process
+ * completely unhindered with 0ms delay.
  * Must be called with binder_fp_lock held.
  */
-static unsigned int binder_fp_get_delay_locked(pid_t tgid)
+static unsigned int binder_fp_get_delay_locked(pid_t tid)
 {
 	struct binder_fp_slot *slot = NULL, *oldest = NULL;
 	unsigned long now = jiffies;
-	unsigned int delay_ms = 0;
 	int i;
 
 	for (i = 0; i < FP_SLOTS; i++) {
-		if (binder_fp_slots[i].tgid == tgid) {
+		if (binder_fp_slots[i].tid == tid) {
 			slot = &binder_fp_slots[i];
 			break;
 		}
@@ -3078,9 +3080,8 @@ static unsigned int binder_fp_get_delay_locked(pid_t tgid)
 	}
 
 	if (!slot) {
-		/* Evict least-recently-used slot */
 		slot = oldest;
-		slot->tgid = tgid;
+		slot->tid = tid;
 		slot->win_start = now;
 		slot->win_count = 0;
 		slot->backoff_level = 0;
@@ -3088,14 +3089,14 @@ static unsigned int binder_fp_get_delay_locked(pid_t tgid)
 
 	slot->last_query = now;
 
-	/* Reset slot if the PID has been quiet for FP_QUIET_JIFFIES */
+	/* Reset slot if thread has been quiet */
 	if (time_after(now, slot->win_start + FP_QUIET_JIFFIES)) {
 		slot->win_start = now;
 		slot->win_count = 0;
 		slot->backoff_level = 0;
 	}
 
-	/* Roll window if it expired */
+	/* Roll window if expired */
 	if (time_after(now, slot->win_start + FP_WIN_JIFFIES)) {
 		slot->win_start = now;
 		slot->win_count = 0;
@@ -3103,24 +3104,10 @@ static unsigned int binder_fp_get_delay_locked(pid_t tgid)
 
 	slot->win_count++;
 
-	if (slot->win_count <= FP_BURST) {
-		/* Within burst allowance – no delay, but advance back-off if
-		 * we've been seeing bursts repeatedly (backoff_level > 0). */
-		if (slot->backoff_level > 0) {
-			delay_ms = FP_BACKOFF_MIN_MS << (slot->backoff_level - 1);
-			if (delay_ms > FP_BACKOFF_MAX_MS)
-				delay_ms = FP_BACKOFF_MAX_MS;
-		}
-	} else {
-		/* Exceeded burst: ramp up back-off */
-		if (slot->backoff_level < 5)
-			slot->backoff_level++;
-		delay_ms = FP_BACKOFF_MIN_MS << (slot->backoff_level - 1);
-		if (delay_ms > FP_BACKOFF_MAX_MS)
-			delay_ms = FP_BACKOFF_MAX_MS;
-	}
+	if (slot->win_count <= FP_BURST)
+		return 0;
 
-	return delay_ms;
+	return 1000;
 }
 
 /*
@@ -3166,7 +3153,8 @@ static bool binder_fp_scan_region(struct binder_proc *proc,
 static bool binder_buffer_has_fp(struct binder_proc *proc,
 				 struct binder_buffer *buffer)
 {
-	size_t off_region_start;
+	size_t off_start;
+	size_t off_end;
 	size_t sg_start;
 
 	if (!buffer)
@@ -3180,9 +3168,9 @@ static bool binder_buffer_has_fp(struct binder_proc *proc,
 		return true;
 
 	/* Region 2: scatter-gather extra buffers (HIDL fqName hidl_string) */
-	off_region_start = ALIGN(buffer->data_size, sizeof(void *));
-	sg_start = off_region_start +
-		   ALIGN(buffer->offsets_size, sizeof(void *));
+	off_start = ALIGN(buffer->data_size, sizeof(void *));
+	off_end = off_start + buffer->offsets_size;
+	sg_start = ALIGN(off_end, sizeof(void *));
 
 	return binder_fp_scan_region(proc, buffer, sg_start,
 				     buffer->extra_buffers_size);
@@ -3866,25 +3854,18 @@ static void binder_transaction(struct binder_proc *proc,
 	}
 
 	/*
-	 * Rate-limit fingerprint service discovery queries to context manager (handle 0).
+	 * Rate-limit runaway HIDL fingerprint service queries on hwbinder ONLY.
 	 * On devices where the sensor is absent/failing, userspace (system_server /
-	 * BiometricScheduler) loops indefinitely querying the HAL, consuming 185%+ CPU
-	 * and crashing hwservicemanager from thread exhaustion.
-	 *
-	 * A working sensor discovers its HAL on the very first query (0ms delay), caches
-	 * the proxy handle, and never queries handle 0 again.
-	 * Devices with a failing/absent sensor have their runaway retries capped at 1Hz,
-	 * dropping CPU usage to ~0% and keeping the phone completely cool.
+	 * BiometricScheduler) loops indefinitely querying the HAL via hwbinder.
+	 * We track by calling thread (current->pid) so UI threads are never affected.
 	 */
 	if (!reply && tr->target.handle == 0 && context->name &&
-	    (strcmp(context->name, "hwbinder") == 0 ||
-	     strcmp(context->name, "binder") == 0)) {
+	    strcmp(context->name, "hwbinder") == 0) {
 		if (binder_buffer_has_fp(target_proc, t->buffer)) {
 			unsigned int delay_ms;
 
 			spin_lock(&binder_fp_lock);
-			delay_ms = binder_fp_get_delay_locked(
-					proc->tsk ? proc->tsk->tgid : proc->pid);
+			delay_ms = binder_fp_get_delay_locked(current->pid);
 			spin_unlock(&binder_fp_lock);
 
 			if (delay_ms)
