@@ -691,7 +691,8 @@ static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &rate_limit_us))
 		return -EINVAL;
 
-	tunables->up_rate_limit_us = clamp(rate_limit_us, 500U, 4000U);
+	/* Filter micro-spikes (min 1.25ms) to eliminate erratic frequency jumping */
+	tunables->up_rate_limit_us = max(rate_limit_us, 1250U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
 		sugov_update_up_rate_limit_us(sg_policy);
@@ -710,10 +711,10 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 
 	/*
-	 * Hold frequency across 120Hz/90Hz frame intervals (12.5ms) to prevent thrashing,
+	 * Hold frequency across 120Hz/90Hz frame intervals (min 12.5ms) to prevent thrashing,
 	 * while downclocking promptly to lowest idle to strictly save battery.
 	 */
-	tunables->down_rate_limit_us = clamp(rate_limit_us, 5000U, 40000U);
+	tunables->down_rate_limit_us = max(rate_limit_us, 12500U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
 		sugov_update_down_rate_limit_us(sg_policy);
@@ -742,8 +743,8 @@ static ssize_t rate_limit_us_store(struct gov_attr_set *attr_set,
 	 * Fast, stutter-free ramp-up (1.25ms) and balanced hold-down (12.5ms)
 	 * to prevent erratic frequency jumping while strictly saving battery.
 	 */
-	tunables->up_rate_limit_us = clamp(rate_limit_us, 500U, 4000U);
-	tunables->down_rate_limit_us = clamp(rate_limit_us, 5000U, 40000U);
+	tunables->up_rate_limit_us = max(rate_limit_us, 1250U);
+	tunables->down_rate_limit_us = max(rate_limit_us, 12500U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		sugov_update_up_rate_limit_us(sg_policy);
