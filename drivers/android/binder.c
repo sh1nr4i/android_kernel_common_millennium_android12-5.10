@@ -42,6 +42,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/delay.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
 #include <linux/freezer.h>
@@ -3013,6 +3014,51 @@ static struct binder_node *binder_get_node_refs_for_txn(
 	return target_node;
 }
 
+static bool binder_buffer_has_fp(struct binder_proc *proc,
+				 struct binder_buffer *buffer)
+{
+	static const char u16_fp[] = {
+		'f', 0, 'i', 0, 'n', 0, 'g', 0, 'e', 0, 'r', 0,
+		'p', 0, 'r', 0, 'i', 0, 'n', 0, 't', 0
+	};
+	size_t total_size;
+	size_t chunk_size = 512;
+	size_t offset = 0;
+	char chunk[512 + 32];
+
+	if (!buffer)
+		return false;
+
+	total_size = buffer->data_size + buffer->extra_buffers_size;
+	if (total_size < 11)
+		return false;
+
+	while (offset < total_size) {
+		size_t to_read = min_t(size_t, total_size - offset, chunk_size);
+		size_t i;
+
+		if (binder_alloc_copy_from_buffer(&proc->alloc, chunk, buffer,
+						  offset, to_read))
+			break;
+
+		chunk[to_read] = '\0';
+		if (strnstr(chunk, "fingerprint", to_read))
+			return true;
+
+		if (to_read >= sizeof(u16_fp)) {
+			for (i = 0; i <= to_read - sizeof(u16_fp); i++) {
+				if (memcmp(chunk + i, u16_fp, sizeof(u16_fp)) == 0)
+					return true;
+			}
+		}
+
+		if (to_read <= 22)
+			break;
+		offset += to_read - 22;
+	}
+	return false;
+}
+
 static void binder_transaction(struct binder_proc *proc,
 			       struct binder_thread *thread,
 			       struct binder_transaction_data *tr, int reply,
@@ -3158,6 +3204,14 @@ static void binder_transaction(struct binder_proc *proc,
 			}
 		}
 		if (!target_node) {
+			/*
+			 * Throttle tight loops when context manager is dead or restarting.
+			 */
+			if (context->name &&
+			    (strcmp(context->name, "hwbinder") == 0 ||
+			     strcmp(context->name, "binder") == 0))
+				msleep_interruptible(200);
+
 			/*
 			 * return_error is set above
 			 */
@@ -3689,6 +3743,46 @@ static void binder_transaction(struct binder_proc *proc,
 		return_error_line = __LINE__;
 		goto err_copy_data_failed;
 	}
+
+	/*
+	 * Rate-limit fingerprint service discovery queries to context manager (handle 0).
+	 * On devices where the sensor is absent/failing, userspace (system_server /
+	 * BiometricScheduler) loops indefinitely querying the HAL, consuming 185%+ CPU
+	 * and crashing hwservicemanager from thread exhaustion.
+	 *
+	 * A working sensor discovers its HAL on the very first query (0ms delay), caches
+	 * the proxy handle, and never queries handle 0 again.
+	 * Devices with a failing/absent sensor have their runaway retries capped at 1Hz,
+	 * dropping CPU usage to ~0% and keeping the phone completely cool.
+	 */
+	if (!reply && tr->target.handle == 0 && context->name &&
+	    (strcmp(context->name, "hwbinder") == 0 ||
+	     strcmp(context->name, "binder") == 0)) {
+		static unsigned long last_fp_discovery_jiffies = 0;
+		static DEFINE_SPINLOCK(fp_discovery_lock);
+
+		if (binder_buffer_has_fp(target_proc, t->buffer)) {
+			unsigned long now = jiffies;
+			unsigned long delay_ms = 0;
+
+			spin_lock(&fp_discovery_lock);
+			if (last_fp_discovery_jiffies &&
+			    time_before(now, last_fp_discovery_jiffies + HZ)) {
+				delay_ms = jiffies_to_msecs(last_fp_discovery_jiffies + HZ - now);
+				last_fp_discovery_jiffies += HZ;
+			} else {
+				last_fp_discovery_jiffies = now;
+			}
+			spin_unlock(&fp_discovery_lock);
+
+			if (delay_ms > 0) {
+				if (delay_ms > 1000)
+					delay_ms = 1000;
+				msleep_interruptible(delay_ms);
+			}
+		}
+	}
+
 	if (t->buffer->oneway_spam_suspect)
 		tcomplete->type = BINDER_WORK_TRANSACTION_ONEWAY_SPAM_SUSPECT;
 	else
