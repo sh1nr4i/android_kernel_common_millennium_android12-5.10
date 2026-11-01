@@ -353,7 +353,7 @@ static void rfx_update_busy_pct(struct rfx_cpu *rfx_c,
 	 * by at most one callback.
 	 */
 	if (!rfx_c->hispeed_active) {
-		if (ktime_to_us(ktime_get()) - rfx_c->prev_wall_time < window_us)
+		if ((time / NSEC_PER_USEC) - rfx_c->prev_wall_time < window_us)
 			return;
 	}
 
@@ -778,6 +778,10 @@ rfx_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf,
 
 static struct governor_attr rfx_rate_limit_us =
 	__ATTR(rate_limit_us, 0644, rfx_rate_limit_us_show, rfx_rate_limit_us_store);
+static struct governor_attr rfx_up_rate_limit_us =
+	__ATTR(up_rate_limit_us, 0644, rfx_rate_limit_us_show, rfx_rate_limit_us_store);
+static struct governor_attr rfx_down_rate_limit_us =
+	__ATTR(down_rate_limit_us, 0644, rfx_rate_limit_us_show, rfx_rate_limit_us_store);
 
 static ssize_t version_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -791,6 +795,8 @@ RFX_TUNABLE_UINT(hispeed_filter_shift);
 static struct attribute *rfx_attrs[] = {
 	&version.attr,
 	&rfx_rate_limit_us.attr,
+	&rfx_up_rate_limit_us.attr,
+	&rfx_down_rate_limit_us.attr,
 	&hispeed_window_us.attr,
 	&hispeed_filter_shift.attr,
 	NULL
