@@ -435,10 +435,10 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
 		return;
 	sg_cpu->iowait_boost_pending = true;
 
-	/* Double the boost at each request */
+	/* Double the boost at each request up to 50% capacity instead of 100% */
 	if (sg_cpu->iowait_boost) {
 		sg_cpu->iowait_boost =
-			min_t(unsigned int, sg_cpu->iowait_boost << 1, SCHED_CAPACITY_SCALE);
+			min_t(unsigned int, sg_cpu->iowait_boost << 1, SCHED_CAPACITY_SCALE / 2);
 		return;
 	}
 
@@ -691,7 +691,7 @@ static ssize_t up_rate_limit_us_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &rate_limit_us))
 		return -EINVAL;
 
-	tunables->up_rate_limit_us = min(rate_limit_us, 500U);
+	tunables->up_rate_limit_us = clamp(rate_limit_us, 500U, 4000U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
 		sugov_update_up_rate_limit_us(sg_policy);
@@ -710,10 +710,10 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 
 	/*
-	 * Hold frequency across frame intervals (min 5ms) to prevent thrashing,
-	 * but ramp down 4x faster than 20ms to save battery and lower CPU load.
+	 * Hold frequency across 120Hz/90Hz frame intervals (12.5ms) to prevent thrashing,
+	 * while downclocking promptly to lowest idle to strictly save battery.
 	 */
-	tunables->down_rate_limit_us = max(rate_limit_us, 5000U);
+	tunables->down_rate_limit_us = clamp(rate_limit_us, 5000U, 40000U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
 		sugov_update_down_rate_limit_us(sg_policy);
@@ -739,11 +739,11 @@ static ssize_t rate_limit_us_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 
 	/*
-	 * Keep fast ramp-up for UI responsiveness (max 500us),
-	 * and hold frequency during frame animations (min 5ms).
+	 * Fast, stutter-free ramp-up (1.25ms) and balanced hold-down (12.5ms)
+	 * to prevent erratic frequency jumping while strictly saving battery.
 	 */
-	tunables->up_rate_limit_us = min(rate_limit_us, 500U);
-	tunables->down_rate_limit_us = max(rate_limit_us, 5000U);
+	tunables->up_rate_limit_us = clamp(rate_limit_us, 500U, 4000U);
+	tunables->down_rate_limit_us = clamp(rate_limit_us, 5000U, 40000U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		sugov_update_up_rate_limit_us(sg_policy);
@@ -924,8 +924,8 @@ static int sugov_init(struct cpufreq_policy *policy)
 		goto stop_kthread;
 	}
 
-	tunables->up_rate_limit_us = 500;
-	tunables->down_rate_limit_us = 5000;
+	tunables->up_rate_limit_us = 1250;
+	tunables->down_rate_limit_us = 12500;
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;
