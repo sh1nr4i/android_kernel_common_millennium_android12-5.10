@@ -22,6 +22,14 @@ jobs:
             bc bison flex libssl-dev gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             libelf-dev libncurses5-dev python3 dwarves curl tar xz-utils make
 
+      - name: Setup Swap Space
+        run: |
+          sudo fallocate -l 10G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=10240
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - name: Download AOSP Clang Toolchain (clang-r416183b)
         run: |
           mkdir -p clang

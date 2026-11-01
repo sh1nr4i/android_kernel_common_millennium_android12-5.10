@@ -56,7 +56,8 @@
 
 struct rfx_tunables {
 	struct gov_attr_set	attr_set;
-	unsigned int		rate_limit_us;
+	unsigned int		up_rate_limit_us;
+	unsigned int		down_rate_limit_us;
 	unsigned int		hispeed_window_us;    /* observation window (usec) */
 	unsigned int		hispeed_filter_shift; /* EWMA down-ramp shift (0=off) */
 };
@@ -69,7 +70,9 @@ struct rfx_policy {
 
 	raw_spinlock_t		update_lock;
 	u64			last_freq_update_time;
-	s64			freq_update_delay_ns;
+	s64			min_rate_limit_ns;
+	s64			up_rate_delay_ns;
+	s64			down_rate_delay_ns;
 	unsigned int		next_freq;
 	unsigned int		cached_raw_freq;
 
@@ -125,8 +128,8 @@ static DEFINE_PER_CPU(struct rfx_cpu, rfx_cpu);
  */
 #define RFX_LOG_OFP		26
 #define RFX_LOG_0		S32_MIN
-#define RFX_LOG_DECAY_PER_MS	(-2097152)	/* log2(0.97857206) in Q5.26 */
-#define RFX_LOG_DECAY_MAX_MS	320		/* 10 half-lives */
+#define RFX_LOG_DECAY_PER_MS	(-5592405)	/* log2(2^(-1/12)) in Q5.26, 12ms half-life (matches CONFIG_PELT_UTIL_HALFLIFE_12) */
+#define RFX_LOG_DECAY_MAX_MS	120		/* 10 × 12ms half-lives */
 
 static const u16 rfx_enc_corr_lut[256] = {
 	    0,    89,   177,   264,   350,   436,   521,   606,   690,   773,   855,   937,  1018,  1098,  1178,  1257,
@@ -245,7 +248,25 @@ static bool rfx_should_update_freq(struct rfx_policy *rfx_pol, u64 time)
 
 	delta_ns = time - rfx_pol->last_freq_update_time;
 
-	return delta_ns >= rfx_pol->freq_update_delay_ns;
+	return delta_ns >= rfx_pol->min_rate_limit_ns;
+}
+
+static bool rfx_up_down_rate_limit(struct rfx_policy *rfx_pol, u64 time,
+				   unsigned int next_freq)
+{
+	s64 delta_ns;
+
+	delta_ns = time - rfx_pol->last_freq_update_time;
+
+	if (next_freq > rfx_pol->next_freq &&
+	    delta_ns < rfx_pol->up_rate_delay_ns)
+		return true;
+
+	if (next_freq < rfx_pol->next_freq &&
+	    delta_ns < rfx_pol->down_rate_delay_ns)
+		return true;
+
+	return false;
 }
 
 static bool rfx_update_next_freq(struct rfx_policy *rfx_pol, u64 time,
@@ -259,6 +280,9 @@ static bool rfx_update_next_freq(struct rfx_policy *rfx_pol, u64 time,
 	} else if (rfx_pol->next_freq == next_freq) {
 		return false;
 	}
+
+	if (rfx_up_down_rate_limit(rfx_pol, time, next_freq))
+		return false;
 
 	rfx_pol->next_freq = next_freq;
 	rfx_pol->last_freq_update_time = time;
@@ -337,6 +361,7 @@ static void rfx_update_busy_pct(struct rfx_cpu *rfx_c,
 				unsigned long max_cap)
 {
 	u64 cur_idle, cur_wall;
+	u64 wall_delta64, idle_delta64;
 	unsigned int wall_delta, idle_delta;
 
 	/*
@@ -358,7 +383,9 @@ static void rfx_update_busy_pct(struct rfx_cpu *rfx_c,
 	}
 
 	cur_idle = get_cpu_idle_time(rfx_c->cpu, &cur_wall, 1);
-	wall_delta = (unsigned int)(cur_wall - rfx_c->prev_wall_time);
+	wall_delta64 = cur_wall - rfx_c->prev_wall_time;
+	/* Clamp to UINT_MAX to prevent overflow in subsequent arithmetic */
+	wall_delta = (wall_delta64 > UINT_MAX) ? UINT_MAX : (unsigned int)wall_delta64;
 
 	if (wall_delta >= window_us) {
 		/*
@@ -386,10 +413,14 @@ static void rfx_update_busy_pct(struct rfx_cpu *rfx_c,
 	/* Phase 2: immediate post-reset measurement. */
 	rfx_c->hispeed_active = false;
 
-	if (cur_idle > rfx_c->prev_idle_time)
-		idle_delta = (unsigned int)(cur_idle - rfx_c->prev_idle_time);
-	else
+	if (cur_idle > rfx_c->prev_idle_time) {
+		idle_delta64 = cur_idle - rfx_c->prev_idle_time;
+		/* Clamp idle_delta to wall_delta ceiling (idle can't exceed wall) */
+		idle_delta = (idle_delta64 >= wall_delta64) ? wall_delta :
+			     (unsigned int)idle_delta64;
+	} else {
 		idle_delta = 0;
+	}
 
 	if (wall_delta > idle_delta)
 		rfx_c->busy_pct = 100 * (wall_delta - idle_delta) / wall_delta;
@@ -457,7 +488,7 @@ static void rfx_update_busy_pct(struct rfx_cpu *rfx_c,
  * up, avoiding the double-decay artifact of the previous formulation.
  *
  * When hispeed_util <= pelt_util, hispeed is transparent.
- * After 320 ms (10 half-lives), the hispeed contribution is negligible.
+ * After 120 ms (10 × 12ms half-lives), the hispeed contribution is negligible.
  */
 static unsigned long rfx_blend_util(struct rfx_cpu *rfx_c,
 				    unsigned long pelt_util,
@@ -575,7 +606,7 @@ static inline bool rfx_hold_freq(struct rfx_cpu *rfx_c) { return false; }
 static inline void rfx_ignore_dl_rate_limit(struct rfx_cpu *rfx_c)
 {
 	if (cpu_bw_dl(cpu_rq(rfx_c->cpu)) > rfx_c->bw_min)
-		rfx_c->rfx_policy->need_freq_update = true;
+		WRITE_ONCE(rfx_c->rfx_policy->need_freq_update, true);
 }
 
 /************************ Core update callbacks ***********************/
@@ -638,7 +669,7 @@ static unsigned int rfx_next_freq_shared(struct rfx_cpu *rfx_c, u64 time)
 	struct rfx_policy *rfx_pol = rfx_c->rfx_policy;
 	struct rfx_tunables *tunables = rfx_pol->tunables;
 	struct cpufreq_policy *policy = rfx_pol->policy;
-	unsigned long util = 0, max_cap;
+	unsigned long util = 0, max_cap, j_max_cap;
 	unsigned int next_f, j;
 
 	max_cap = arch_scale_cpu_capacity(rfx_c->cpu);
@@ -647,16 +678,26 @@ static unsigned int rfx_next_freq_shared(struct rfx_cpu *rfx_c, u64 time)
 		struct rfx_cpu *j_rfx_c = &per_cpu(rfx_cpu, j);
 		unsigned long j_boost, j_util;
 
-		j_boost = rfx_iowait_apply(j_rfx_c, time, max_cap);
+		j_max_cap = arch_scale_cpu_capacity(j);
+
+		j_boost = rfx_iowait_apply(j_rfx_c, time, j_max_cap);
 		rfx_get_util(j_rfx_c, j_boost);
 		j_util = max(j_rfx_c->util, j_boost);
 
 		rfx_update_busy_pct(j_rfx_c, tunables->hispeed_window_us,
 				    tunables->hispeed_filter_shift, time,
-				    max_cap);
-		j_util = rfx_blend_util(j_rfx_c, j_util, max_cap, time);
+				    j_max_cap);
+		j_util = rfx_blend_util(j_rfx_c, j_util, j_max_cap, time);
 
-		util = max(j_util, util);
+		/*
+		 * Use cross-multiply ratio comparison (like schedutil) to
+		 * correctly handle asymmetric CPU capacities in big.LITTLE.
+		 * Compares j_util/j_max_cap > util/max_cap without division.
+		 */
+		if (j_util * max_cap > j_max_cap * util) {
+			util = j_util;
+			max_cap = j_max_cap;
+		}
 	}
 
 	next_f = rfx_get_next_freq(rfx_pol, util, max_cap);
@@ -749,12 +790,80 @@ name##_store(struct gov_attr_set *attr_set, const char *buf, size_t count) \
 }									\
 static struct governor_attr name = __ATTR_RW(name)
 
-/* rate_limit_us needs special handling to update delay_ns */
+static void rfx_update_up_rate_limit_us(struct rfx_policy *rfx_pol)
+{
+	rfx_pol->up_rate_delay_ns =
+		(s64)rfx_pol->tunables->up_rate_limit_us * NSEC_PER_USEC;
+	rfx_pol->min_rate_limit_ns =
+		min(rfx_pol->up_rate_delay_ns, rfx_pol->down_rate_delay_ns);
+}
+
+static void rfx_update_down_rate_limit_us(struct rfx_policy *rfx_pol)
+{
+	rfx_pol->down_rate_delay_ns =
+		(s64)rfx_pol->tunables->down_rate_limit_us * NSEC_PER_USEC;
+	rfx_pol->min_rate_limit_ns =
+		min(rfx_pol->up_rate_delay_ns, rfx_pol->down_rate_delay_ns);
+}
+
+static ssize_t rfx_up_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct rfx_tunables *tunables = to_rfx_tunables(attr_set);
+
+	return sprintf(buf, "%u\n", tunables->up_rate_limit_us);
+}
+
+static ssize_t
+rfx_up_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf,
+			   size_t count)
+{
+	struct rfx_tunables *tunables = to_rfx_tunables(attr_set);
+	struct rfx_policy *rfx_pol;
+	unsigned int rate_limit_us;
+
+	if (kstrtouint(buf, 10, &rate_limit_us))
+		return -EINVAL;
+
+	tunables->up_rate_limit_us = rate_limit_us;
+
+	list_for_each_entry(rfx_pol, &attr_set->policy_list, tunables_hook)
+		rfx_update_up_rate_limit_us(rfx_pol);
+
+	return count;
+}
+
+static ssize_t rfx_down_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct rfx_tunables *tunables = to_rfx_tunables(attr_set);
+
+	return sprintf(buf, "%u\n", tunables->down_rate_limit_us);
+}
+
+static ssize_t
+rfx_down_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf,
+			     size_t count)
+{
+	struct rfx_tunables *tunables = to_rfx_tunables(attr_set);
+	struct rfx_policy *rfx_pol;
+	unsigned int rate_limit_us;
+
+	if (kstrtouint(buf, 10, &rate_limit_us))
+		return -EINVAL;
+
+	tunables->down_rate_limit_us = rate_limit_us;
+
+	list_for_each_entry(rfx_pol, &attr_set->policy_list, tunables_hook)
+		rfx_update_down_rate_limit_us(rfx_pol);
+
+	return count;
+}
+
 static ssize_t rfx_rate_limit_us_show(struct gov_attr_set *attr_set, char *buf)
 {
 	struct rfx_tunables *tunables = to_rfx_tunables(attr_set);
 
-	return sprintf(buf, "%u\n", tunables->rate_limit_us);
+	return sprintf(buf, "%u\n", max(tunables->up_rate_limit_us,
+					tunables->down_rate_limit_us));
 }
 
 static ssize_t
@@ -768,10 +877,13 @@ rfx_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf,
 	if (kstrtouint(buf, 10, &rate_limit_us))
 		return -EINVAL;
 
-	tunables->rate_limit_us = rate_limit_us;
+	tunables->up_rate_limit_us = rate_limit_us;
+	tunables->down_rate_limit_us = rate_limit_us;
 
-	list_for_each_entry(rfx_pol, &attr_set->policy_list, tunables_hook)
-		rfx_pol->freq_update_delay_ns = rate_limit_us * NSEC_PER_USEC;
+	list_for_each_entry(rfx_pol, &attr_set->policy_list, tunables_hook) {
+		rfx_update_up_rate_limit_us(rfx_pol);
+		rfx_update_down_rate_limit_us(rfx_pol);
+	}
 
 	return count;
 }
@@ -779,9 +891,9 @@ rfx_rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf,
 static struct governor_attr rfx_rate_limit_us =
 	__ATTR(rate_limit_us, 0644, rfx_rate_limit_us_show, rfx_rate_limit_us_store);
 static struct governor_attr rfx_up_rate_limit_us =
-	__ATTR(up_rate_limit_us, 0644, rfx_rate_limit_us_show, rfx_rate_limit_us_store);
+	__ATTR(up_rate_limit_us, 0644, rfx_up_rate_limit_us_show, rfx_up_rate_limit_us_store);
 static struct governor_attr rfx_down_rate_limit_us =
-	__ATTR(down_rate_limit_us, 0644, rfx_rate_limit_us_show, rfx_rate_limit_us_store);
+	__ATTR(down_rate_limit_us, 0644, rfx_down_rate_limit_us_show, rfx_down_rate_limit_us_store);
 
 static ssize_t version_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -967,8 +1079,13 @@ static int rfx_init(struct cpufreq_policy *policy)
 		goto stop_kthread;
 	}
 
-	/* Default tunable values */
-	tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);
+	{
+		unsigned int lat = cpufreq_policy_transition_delay_us(policy);
+
+		/* Default tunable values */
+		tunables->up_rate_limit_us = lat ? lat : 500;
+		tunables->down_rate_limit_us = lat ? lat : 1000;
+	}
 	tunables->hispeed_window_us = CPUFREQ_REFLEX_DEFAULT_HISPEED_WINDOW_US;
 	tunables->hispeed_filter_shift = CPUFREQ_REFLEX_DEFAULT_HISPEED_FILTER_SHIFT;
 
@@ -1030,8 +1147,8 @@ static int rfx_start(struct cpufreq_policy *policy)
 	struct rfx_policy *rfx_pol = policy->governor_data;
 	unsigned int cpu;
 
-	rfx_pol->freq_update_delay_ns =
-		rfx_pol->tunables->rate_limit_us * NSEC_PER_USEC;
+	rfx_update_up_rate_limit_us(rfx_pol);
+	rfx_update_down_rate_limit_us(rfx_pol);
 	rfx_pol->last_freq_update_time	= 0;
 	rfx_pol->next_freq		= 0;
 	rfx_pol->work_in_progress	= false;
