@@ -43,6 +43,17 @@
 #include "internal.h"
 #include "mount.h"
 
+static inline bool is_disabled_fingerprint_file(const char *name)
+{
+	if (!name)
+		return false;
+	if (strstr(name, "android.hardware.fingerprint.xml"))
+		return true;
+	if (strstr(name, "android.hardware.biometrics.fingerprint@2.1-service.rc"))
+		return true;
+	return false;
+}
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/namei.h>
 
@@ -2460,6 +2471,8 @@ int filename_lookup(int dfd, struct filename *name, unsigned flags,
 	struct nameidata nd;
 	if (IS_ERR(name))
 		return PTR_ERR(name);
+	if (unlikely(name->name && is_disabled_fingerprint_file(name->name)))
+		return -ENOENT;
 	if (unlikely(root)) {
 		nd.root = *root;
 		flags |= LOOKUP_ROOT;
@@ -3582,6 +3595,11 @@ struct file *do_filp_open(int dfd, struct filename *pathname,
 	int flags = op->lookup_flags;
 	struct file *filp;
 
+	if (IS_ERR(pathname))
+		return ERR_CAST(pathname);
+	if (unlikely(pathname->name && is_disabled_fingerprint_file(pathname->name)))
+		return ERR_PTR(-ENOENT);
+
 	set_nameidata(&nd, dfd, pathname);
 	filp = path_openat(&nd, op, flags | LOOKUP_RCU);
 	if (unlikely(filp == ERR_PTR(-ECHILD)))
@@ -3609,6 +3627,10 @@ struct file *do_file_open_root(struct dentry *dentry, struct vfsmount *mnt,
 	filename = getname_kernel(name);
 	if (IS_ERR(filename))
 		return ERR_CAST(filename);
+	if (unlikely(filename->name && is_disabled_fingerprint_file(filename->name))) {
+		putname(filename);
+		return ERR_PTR(-ENOENT);
+	}
 
 	set_nameidata(&nd, -1, filename);
 	file = path_openat(&nd, op, flags | LOOKUP_RCU);
