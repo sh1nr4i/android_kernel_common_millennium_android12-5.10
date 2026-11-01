@@ -676,6 +676,9 @@ static struct cpufreq_governor *cpufreq_parse_governor(char *str_governor)
 	if (t)
 		return t;
 
+	if (!strncasecmp(str_governor, "reflex", 6))
+		return get_governor("schedutil");
+
 	if (request_module("cpufreq_%s", str_governor))
 		return NULL;
 
