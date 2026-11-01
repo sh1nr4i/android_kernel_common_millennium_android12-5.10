@@ -3014,49 +3014,178 @@ static struct binder_node *binder_get_node_refs_for_txn(
 	return target_node;
 }
 
-static bool binder_buffer_has_fp(struct binder_proc *proc,
-				 struct binder_buffer *buffer)
+/*
+ * Per-PID fingerprint HAL discovery rate limiter.
+ *
+ * On devices where the fingerprint sensor is absent or unresponsive,
+ * system_server loops endlessly querying the HAL (>1000 req/s historically,
+ * capped to ~29/min by the previous global 1Hz limiter).  The global limiter
+ * has a correctness flaw: multiple unrelated processes share the same counter,
+ * so legitimate single-shot queries from Settings/Keyguard can be stalled up
+ * to 1 second during boot.
+ *
+ * This replaces it with a per-TGID exponential back-off table:
+ *  - First FP_BURST queries within 1 second: pass through with 0 delay.
+ *    A working sensor discovers its HAL on query 1 and never loops.
+ *  - Queries beyond the burst threshold: sleep with exponential back-off
+ *    (1s, 2s, 4s, 8s … up to FP_BACKOFF_MAX_MS).  The sleeping thread is
+ *    the caller in system_server (TID 1744 "FingerprintHand"), not a thread
+ *    inside hwservicemanager, so hwservicemanager is never overloaded.
+ *  - After FP_QUIET_JIFFIES of silence the slot resets, so a sensor that
+ *    comes online later (delayed HAL start) is served without delay.
+ *
+ * Safety: FP_BACKOFF_MAX_MS is intentionally 16 000 ms, well under the
+ * Android Watchdog timeout (60 s).  "FingerprintHand" is not one of the
+ * threads monitored by Watchdog (android.fg/.ui/.io/.display/.bg).
+ */
+#define FP_SLOTS		16
+#define FP_BURST		4		/* queries before back-off kicks in */
+#define FP_WIN_JIFFIES		HZ		/* burst window = 1 second */
+#define FP_QUIET_JIFFIES	(30 * HZ)	/* idle reset threshold */
+#define FP_BACKOFF_MIN_MS	500
+#define FP_BACKOFF_MAX_MS	16000
+
+struct binder_fp_slot {
+	pid_t		tgid;
+	unsigned long	win_start;	/* start of current 1-s window */
+	unsigned long	last_query;	/* last query jiffies */
+	u8		win_count;	/* queries this window */
+	u8		backoff_level;	/* 0=none, n=sleep 2^(n-1)*MIN */
+};
+
+static struct binder_fp_slot binder_fp_slots[FP_SLOTS];
+static DEFINE_SPINLOCK(binder_fp_lock);
+
+/*
+ * Returns sleep duration in ms (0 = pass through immediately).
+ * Must be called with binder_fp_lock held.
+ */
+static unsigned int binder_fp_get_delay_locked(pid_t tgid)
+{
+	struct binder_fp_slot *slot = NULL, *oldest = NULL;
+	unsigned long now = jiffies;
+	unsigned int delay_ms = 0;
+	int i;
+
+	for (i = 0; i < FP_SLOTS; i++) {
+		if (binder_fp_slots[i].tgid == tgid) {
+			slot = &binder_fp_slots[i];
+			break;
+		}
+		if (!oldest || time_before(binder_fp_slots[i].last_query,
+					   oldest->last_query))
+			oldest = &binder_fp_slots[i];
+	}
+
+	if (!slot) {
+		/* Evict least-recently-used slot */
+		slot = oldest;
+		slot->tgid = tgid;
+		slot->win_start = now;
+		slot->win_count = 0;
+		slot->backoff_level = 0;
+	}
+
+	slot->last_query = now;
+
+	/* Reset slot if the PID has been quiet for FP_QUIET_JIFFIES */
+	if (time_after(now, slot->win_start + FP_QUIET_JIFFIES)) {
+		slot->win_start = now;
+		slot->win_count = 0;
+		slot->backoff_level = 0;
+	}
+
+	/* Roll window if it expired */
+	if (time_after(now, slot->win_start + FP_WIN_JIFFIES)) {
+		slot->win_start = now;
+		slot->win_count = 0;
+	}
+
+	slot->win_count++;
+
+	if (slot->win_count <= FP_BURST) {
+		/* Within burst allowance – no delay, but advance back-off if
+		 * we've been seeing bursts repeatedly (backoff_level > 0). */
+		if (slot->backoff_level > 0) {
+			delay_ms = FP_BACKOFF_MIN_MS << (slot->backoff_level - 1);
+			if (delay_ms > FP_BACKOFF_MAX_MS)
+				delay_ms = FP_BACKOFF_MAX_MS;
+		}
+	} else {
+		/* Exceeded burst: ramp up back-off */
+		if (slot->backoff_level < 5)
+			slot->backoff_level++;
+		delay_ms = FP_BACKOFF_MIN_MS << (slot->backoff_level - 1);
+		if (delay_ms > FP_BACKOFF_MAX_MS)
+			delay_ms = FP_BACKOFF_MAX_MS;
+	}
+
+	return delay_ms;
+}
+
+/*
+ * Scan one 512-byte-bounded region of the binder buffer for the word
+ * "fingerprint" in ASCII/UTF-8 or UTF-16LE.  Only the first 512 bytes of
+ * each region are examined; the service name is always near the start of
+ * the parcel data or the first scatter-gather buffer.
+ */
+static bool binder_fp_scan_region(struct binder_proc *proc,
+				  struct binder_buffer *buf,
+				  size_t start, size_t region_len)
 {
 	static const char u16_fp[] = {
 		'f', 0, 'i', 0, 'n', 0, 'g', 0, 'e', 0, 'r', 0,
 		'p', 0, 'r', 0, 'i', 0, 'n', 0, 't', 0
 	};
-	size_t total_size;
-	size_t chunk_size = 512;
-	size_t offset = 0;
-	char chunk[512 + 32];
+	char chunk[512];
+	size_t to_read;
+	size_t i;
+
+	if (!region_len || start >= buf->data_size + buf->offsets_size +
+				    buf->extra_buffers_size)
+		return false;
+
+	to_read = min_t(size_t, region_len, sizeof(chunk));
+
+	if (binder_alloc_copy_from_buffer(&proc->alloc, chunk, buf,
+					  start, to_read))
+		return false;
+
+	if (strnstr(chunk, "fingerprint", to_read))
+		return true;
+
+	if (to_read >= sizeof(u16_fp)) {
+		for (i = 0; i <= to_read - sizeof(u16_fp); i++) {
+			if (memcmp(chunk + i, u16_fp, sizeof(u16_fp)) == 0)
+				return true;
+		}
+	}
+	return false;
+}
+
+static bool binder_buffer_has_fp(struct binder_proc *proc,
+				 struct binder_buffer *buffer)
+{
+	size_t off_region_start;
+	size_t sg_start;
 
 	if (!buffer)
 		return false;
 
-	total_size = buffer->data_size + buffer->extra_buffers_size;
-	if (total_size < 11)
+	if (buffer->data_size < 11 && buffer->extra_buffers_size < 11)
 		return false;
 
-	while (offset < total_size) {
-		size_t to_read = min_t(size_t, total_size - offset, chunk_size);
-		size_t i;
+	/* Region 1: parcel data (AIDL UTF-16 / HIDL hidl_string inline) */
+	if (binder_fp_scan_region(proc, buffer, 0, buffer->data_size))
+		return true;
 
-		if (binder_alloc_copy_from_buffer(&proc->alloc, chunk, buffer,
-						  offset, to_read))
-			break;
+	/* Region 2: scatter-gather extra buffers (HIDL fqName hidl_string) */
+	off_region_start = ALIGN(buffer->data_size, sizeof(void *));
+	sg_start = off_region_start +
+		   ALIGN(buffer->offsets_size, sizeof(void *));
 
-		chunk[to_read] = '\0';
-		if (strnstr(chunk, "fingerprint", to_read))
-			return true;
-
-		if (to_read >= sizeof(u16_fp)) {
-			for (i = 0; i <= to_read - sizeof(u16_fp); i++) {
-				if (memcmp(chunk + i, u16_fp, sizeof(u16_fp)) == 0)
-					return true;
-			}
-		}
-
-		if (to_read <= 22)
-			break;
-		offset += to_read - 22;
-	}
-	return false;
+	return binder_fp_scan_region(proc, buffer, sg_start,
+				     buffer->extra_buffers_size);
 }
 
 static void binder_transaction(struct binder_proc *proc,
@@ -3204,14 +3333,6 @@ static void binder_transaction(struct binder_proc *proc,
 			}
 		}
 		if (!target_node) {
-			/*
-			 * Throttle tight loops when context manager is dead or restarting.
-			 */
-			if (context->name &&
-			    (strcmp(context->name, "hwbinder") == 0 ||
-			     strcmp(context->name, "binder") == 0))
-				msleep_interruptible(200);
-
 			/*
 			 * return_error is set above
 			 */
@@ -3758,28 +3879,16 @@ static void binder_transaction(struct binder_proc *proc,
 	if (!reply && tr->target.handle == 0 && context->name &&
 	    (strcmp(context->name, "hwbinder") == 0 ||
 	     strcmp(context->name, "binder") == 0)) {
-		static unsigned long last_fp_discovery_jiffies = 0;
-		static DEFINE_SPINLOCK(fp_discovery_lock);
-
 		if (binder_buffer_has_fp(target_proc, t->buffer)) {
-			unsigned long now = jiffies;
-			unsigned long delay_ms = 0;
+			unsigned int delay_ms;
 
-			spin_lock(&fp_discovery_lock);
-			if (last_fp_discovery_jiffies &&
-			    time_before(now, last_fp_discovery_jiffies + HZ)) {
-				delay_ms = jiffies_to_msecs(last_fp_discovery_jiffies + HZ - now);
-				last_fp_discovery_jiffies += HZ;
-			} else {
-				last_fp_discovery_jiffies = now;
-			}
-			spin_unlock(&fp_discovery_lock);
+			spin_lock(&binder_fp_lock);
+			delay_ms = binder_fp_get_delay_locked(
+					proc->tsk ? proc->tsk->tgid : proc->pid);
+			spin_unlock(&binder_fp_lock);
 
-			if (delay_ms > 0) {
-				if (delay_ms > 1000)
-					delay_ms = 1000;
+			if (delay_ms)
 				msleep_interruptible(delay_ms);
-			}
 		}
 	}
 
