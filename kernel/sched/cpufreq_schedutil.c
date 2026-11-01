@@ -709,7 +709,11 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &rate_limit_us))
 		return -EINVAL;
 
-	tunables->down_rate_limit_us = max(rate_limit_us, 20000U);
+	/*
+	 * Hold frequency across frame intervals (min 5ms) to prevent thrashing,
+	 * but ramp down 4x faster than 20ms to save battery and lower CPU load.
+	 */
+	tunables->down_rate_limit_us = max(rate_limit_us, 5000U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
 		sugov_update_down_rate_limit_us(sg_policy);
@@ -736,10 +740,10 @@ static ssize_t rate_limit_us_store(struct gov_attr_set *attr_set,
 
 	/*
 	 * Keep fast ramp-up for UI responsiveness (max 500us),
-	 * and hold frequency during frame animations (min 20ms).
+	 * and hold frequency during frame animations (min 5ms).
 	 */
 	tunables->up_rate_limit_us = min(rate_limit_us, 500U);
-	tunables->down_rate_limit_us = max(rate_limit_us, 20000U);
+	tunables->down_rate_limit_us = max(rate_limit_us, 5000U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		sugov_update_up_rate_limit_us(sg_policy);
@@ -921,7 +925,7 @@ static int sugov_init(struct cpufreq_policy *policy)
 	}
 
 	tunables->up_rate_limit_us = 500;
-	tunables->down_rate_limit_us = 20000;
+	tunables->down_rate_limit_us = 5000;
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;

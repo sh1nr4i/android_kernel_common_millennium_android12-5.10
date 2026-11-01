@@ -3855,21 +3855,25 @@ static void binder_transaction(struct binder_proc *proc,
 
 	/*
 	 * Rate-limit runaway HIDL fingerprint service queries on hwbinder ONLY.
-	 * On devices where the sensor is absent/failing, userspace (system_server /
-	 * BiometricScheduler) loops indefinitely querying the HAL via hwbinder.
-	 * We track by calling thread (current->pid) so UI threads are never affected.
+	 * On devices where the sensor is absent/failing, the background worker
+	 * ("FingerprintHand" in system_server) loops querying the HAL via hwbinder.
+	 * We restrict throttling strictly to biometric handler threads so interactive
+	 * UI threads, Keyguard, and apps are NEVER delayed or scanned.
 	 */
 	if (!reply && tr->target.handle == 0 && context->name &&
 	    strcmp(context->name, "hwbinder") == 0) {
-		if (binder_buffer_has_fp(target_proc, t->buffer)) {
-			unsigned int delay_ms;
+		if (strstr(current->comm, "Fingerprint") ||
+		    strstr(current->comm, "Biometric")) {
+			if (binder_buffer_has_fp(target_proc, t->buffer)) {
+				unsigned int delay_ms;
 
-			spin_lock(&binder_fp_lock);
-			delay_ms = binder_fp_get_delay_locked(current->pid);
-			spin_unlock(&binder_fp_lock);
+				spin_lock(&binder_fp_lock);
+				delay_ms = binder_fp_get_delay_locked(current->pid);
+				spin_unlock(&binder_fp_lock);
 
-			if (delay_ms)
-				msleep_interruptible(delay_ms);
+				if (delay_ms)
+					msleep_interruptible(delay_ms);
+			}
 		}
 	}
 
