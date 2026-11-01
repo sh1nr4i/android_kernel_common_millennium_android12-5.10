@@ -63,13 +63,7 @@ jobs:
               echo "No changes in chihiro/Image.gz"
             else
               git add chihiro/Image.gz
-              git commit -m "common-kernel: Update Chihiro kernel image
-
-- Compiled from sh1nr4i/android_kernel_common_millennium_android12-5.10@${GITHUB_SHA}
-- Governor fixes for performance/schedutil tunables
-- Reflex governor rate_limit_us compatibility & ktime fastpath
-- Compiler optimization O3 enabled
-- Battery usage and workload responsiveness improvements"
+              git commit -m "common-kernel: Update Chihiro kernel image" -m "Compiled from sh1nr4i/android_kernel_common_millennium_android12-5.10@${{ github.sha }}" -m "Governor fixes, reflex rate_limit_us compatibility, fastpath optimization, O3 optimization"
               git push origin seventeen
               echo "Successfully pushed updated Chihiro Image.gz to sh1nr4i/android_device_millennium_common-kernel (seventeen)!"
             fi
