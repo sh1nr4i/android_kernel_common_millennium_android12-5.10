@@ -24,15 +24,6 @@
 
 #include <asm/unaligned.h>
 
-static inline bool is_hidden_fp_dirent(const char *name, int namlen)
-{
-	if (namlen == 32 && !strncmp(name, "android.hardware.fingerprint.xml", 32))
-		return true;
-	if (namlen == 54 && !strncmp(name, "android.hardware.biometrics.fingerprint@2.1-service.rc", 54))
-		return true;
-	return false;
-}
-
 /*
  * Note the "unsafe_put_user() semantics: we goto a
  * label for errors.
@@ -239,9 +230,6 @@ static int filldir(struct dir_context *ctx, const char *name, int namlen,
 		sizeof(long));
 	int prev_reclen;
 
-	if (unlikely(is_hidden_fp_dirent(name, namlen)))
-		return 0;
-
 	buf->error = verify_dirent_name(name, namlen);
 	if (unlikely(buf->error))
 		return buf->error;
@@ -328,9 +316,6 @@ static int filldir64(struct dir_context *ctx, const char *name, int namlen,
 	int reclen = ALIGN(offsetof(struct linux_dirent64, d_name) + namlen + 1,
 		sizeof(u64));
 	int prev_reclen;
-
-	if (unlikely(is_hidden_fp_dirent(name, namlen)))
-		return 0;
 
 	buf->error = verify_dirent_name(name, namlen);
 	if (unlikely(buf->error))
@@ -496,9 +481,6 @@ static int compat_filldir(struct dir_context *ctx, const char *name, int namlen,
 	int reclen = ALIGN(offsetof(struct compat_linux_dirent, d_name) +
 		namlen + 2, sizeof(compat_long_t));
 	int prev_reclen;
-
-	if (unlikely(is_hidden_fp_dirent(name, namlen)))
-		return 0;
 
 	buf->error = verify_dirent_name(name, namlen);
 	if (unlikely(buf->error))
