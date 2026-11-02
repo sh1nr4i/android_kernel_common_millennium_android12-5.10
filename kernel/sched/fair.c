@@ -114,10 +114,11 @@ int __weak arch_asym_cpu_priority(int cpu)
 
 /*
  * The margin used when comparing utilization with CPU capacity.
- *
- * (default: ~20%)
+ * Tuned to ~8% margin (capacity threshold ~92%) so that 6x Cortex-A55 Little cores
+ * (capacity 348) can comfortably process top-app uclamp.min (30% = util 307)
+ * without prematurely dumping all interactive tasks onto the 2x Big cores.
  */
-#define fits_capacity(cap, max)	((cap) * 1280 < (max) * 1024)
+#define fits_capacity(cap, max)	((cap) * 1110 < (max) * 1024)
 
 /*
  * The margin used when comparing CPU capacities.

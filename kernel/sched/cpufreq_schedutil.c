@@ -219,10 +219,10 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 		freq = policy->cpuinfo.max_freq;
 	else
 		/*
-		 * Apply a 12.5% margin so that we select a higher frequency than
+		 * Apply a 25% margin so that we select a higher frequency than
 		 * the current one before the CPU is fully busy:
 		 */
-		freq = policy->cur + (policy->cur >> 3);
+		freq = policy->cur + (policy->cur >> 2);
 
 	trace_android_vh_map_util_freq(util, freq, max, &next_freq, policy,
 			&sg_policy->need_freq_update);
@@ -243,10 +243,10 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 		return l_freq;
 
 	/*
-	 * Use the frequency step below if the calculated frequency is <20%
-	 * higher than it.
+	 * Use the frequency step below if the calculated frequency is closer to it
+	 * (<50% midpoint threshold) to avoid aggressive over-scaling to max OPP.
 	 */
-	if (mult_frac(100, freq - h_freq, l_freq - h_freq) < 20)
+	if (mult_frac(100, freq - h_freq, l_freq - h_freq) < 50)
 		return h_freq;
 
 	return l_freq;
@@ -710,10 +710,10 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set,
 		return -EINVAL;
 
 	/*
-	 * Allow rapid ramp-down after thread execution finishes,
-	 * respecting vendor init.rc settings (down to 500us).
+	 * Hold frequency across frame and audio buffer intervals (min 5ms)
+	 * to prevent thrashing and preserve real-time DSP audio processing.
 	 */
-	tunables->down_rate_limit_us = max(rate_limit_us, 500U);
+	tunables->down_rate_limit_us = max(rate_limit_us, 5000U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
 		sugov_update_down_rate_limit_us(sg_policy);
@@ -740,10 +740,10 @@ static ssize_t rate_limit_us_store(struct gov_attr_set *attr_set,
 
 	/*
 	 * Keep fast ramp-up for UI responsiveness (max 500us),
-	 * and allow prompt ramp-down when load subsides (down to 500us).
+	 * and hold frequency during frame animations and audio cycles (min 5ms).
 	 */
 	tunables->up_rate_limit_us = min(rate_limit_us, 500U);
-	tunables->down_rate_limit_us = max(rate_limit_us, 500U);
+	tunables->down_rate_limit_us = max(rate_limit_us, 5000U);
 
 	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook) {
 		sugov_update_up_rate_limit_us(sg_policy);
@@ -925,7 +925,7 @@ static int sugov_init(struct cpufreq_policy *policy)
 	}
 
 	tunables->up_rate_limit_us = 500;
-	tunables->down_rate_limit_us = 1000;
+	tunables->down_rate_limit_us = 5000;
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;
