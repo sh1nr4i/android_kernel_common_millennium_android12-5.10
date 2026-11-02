@@ -16,6 +16,7 @@
 #include <linux/magic.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
+#include <linux/highmem.h>
 #include "erofs_fs.h"
 
 /* redefine pr_fmt "erofs: " */
@@ -466,6 +467,56 @@ static inline int z_erofs_load_lz4_config(struct super_block *sb,
 #endif	/* !CONFIG_EROFS_FS_ZIP */
 
 #define EFSCORRUPTED    EUCLEAN         /* Filesystem is corrupted */
+
+/*
+ * Fix Transsion Camera crash on custom ROMs / vendor missing scene.tflite
+ * Patch TranASD::init and libtf_asd_lib.so in page cache dynamically on read.
+ */
+static inline void erofs_fixup_camera_page(struct page *page)
+{
+	struct inode *inode;
+	void *kaddr;
+	u32 *insn;
+
+	if (!page || !page->mapping)
+		return;
+
+	inode = page->mapping->host;
+	if (!inode)
+		return;
+
+	/* Fix 1: libTranASD.so (i_size == 32224, page index 4, offset 0x26c)
+	 * In stock Infinix firmware, ASD loads ./vendor/data/camera/model/scene.tflite.
+	 * On custom ROMs (or vendor missing scene.tflite), fopen() returns NULL and
+	 * fseek(NULL, 0, SEEK_END) triggers FORTIFY abort in camerahalserver.
+	 * Patch TranASD::init to immediately return 0 (success) without calling Init_proc.
+	 */
+	if (inode->i_size == 32224 && page->index == 4) {
+		kaddr = kmap_atomic(page);
+		insn = (u32 *)(kaddr + 0x26c);
+		if (insn[0] == 0xd10403ff && insn[1] == 0xfd0063e8) {
+			insn[0] = 0x5280001f; /* mov w0, wzr */
+			insn[1] = 0xd65f03c0; /* ret */
+			flush_dcache_page(page);
+			pr_info("chihiro_kernel: patched TranASD::init in EROFS pagecache!\n");
+		}
+		kunmap_atomic(kaddr);
+	}
+
+	/* Fix 2: libtf_asd_lib.so (i_size == 4959240, page index 353, offset 0x6ec)
+	 * Patch asd_inference_c::InitModel_thread to return cleanly if fopen returned NULL (x0 == 0).
+	 */
+	if (inode->i_size == 4959240 && page->index == 353) {
+		kaddr = kmap_atomic(page);
+		insn = (u32 *)(kaddr + 0x6ec);
+		if (insn[0] == 0x321f03e2 && insn[1] == 0xaa1f03e1) {
+			insn[0] = 0xb40011c0; /* cbz x0, 0x161924 (stack chk & ret) */
+			flush_dcache_page(page);
+			pr_info("chihiro_kernel: patched asd_inference_c::InitModel_thread in EROFS pagecache!\n");
+		}
+		kunmap_atomic(kaddr);
+	}
+}
 
 #endif	/* __EROFS_INTERNAL_H */
 

@@ -23,8 +23,10 @@ static void erofs_readendio(struct bio *bio)
 
 		if (err)
 			SetPageError(page);
-		else
+		else {
+			erofs_fixup_camera_page(page);
 			SetPageUptodate(page);
+		}
 
 		unlock_page(page);
 		/* page could be reclaimed now */
