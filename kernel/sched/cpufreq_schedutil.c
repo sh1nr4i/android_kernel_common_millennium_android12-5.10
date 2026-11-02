@@ -243,11 +243,17 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 		return l_freq;
 
 	/*
-	 * Use the frequency step below if the calculated frequency is closer to it
-	 * (<50% midpoint threshold) to avoid aggressive over-scaling to max OPP.
+	 * For lower OPPs (<= 1.2 GHz), bias towards the lower frequency (h_freq)
+	 * unless utilization clearly exceeds 65% of the step, so that 725MHz,
+	 * 800MHz, and 900MHz are readily accessible instead of over-boosting to >=1GHz.
 	 */
-	if (mult_frac(100, freq - h_freq, l_freq - h_freq) < 50)
-		return h_freq;
+	if (l_freq <= 1200000) {
+		if (mult_frac(100, freq - h_freq, l_freq - h_freq) < 65)
+			return h_freq;
+	} else {
+		if (mult_frac(100, freq - h_freq, l_freq - h_freq) < 50)
+			return h_freq;
+	}
 
 	return l_freq;
 }
@@ -526,7 +532,10 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 	sugov_get_util(sg_cpu);
 	sugov_iowait_apply(sg_cpu, time);
 
-	next_f = get_next_freq(sg_policy, sg_cpu->util, sg_cpu->max);
+	if (cpu_rq(sg_cpu->cpu)->nr_running == 0)
+		next_f = sg_policy->policy->min;
+	else
+		next_f = get_next_freq(sg_policy, sg_cpu->util, sg_cpu->max);
 
 	/*
 	 * This code runs under rq->lock for the target CPU, so it won't run
@@ -548,10 +557,14 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned long util = 0, max = 1;
 	unsigned int j;
+	bool policy_idle = true;
 
 	for_each_cpu(j, policy->cpus) {
 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
 		unsigned long j_util, j_max;
+
+		if (cpu_rq(j)->nr_running)
+			policy_idle = false;
 
 		sugov_get_util(j_sg_cpu);
 		sugov_iowait_apply(j_sg_cpu, time);
@@ -563,6 +576,9 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 			max = j_max;
 		}
 	}
+
+	if (policy_idle)
+		return policy->min;
 
 	return get_next_freq(sg_policy, util, max);
 }

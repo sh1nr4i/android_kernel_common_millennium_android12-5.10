@@ -8288,6 +8288,20 @@ static ssize_t cpu_uclamp_write(struct kernfs_open_file *of, char *buf,
 	rcu_read_lock();
 
 	tg = css_tg(of_css(of));
+
+	/*
+	 * MediaTek vendor init sets /dev/cpuctl/system/cpu.uclamp.min to 100% on boot,
+	 * but forgets to reset it on sys.boot_completed=1. This permanently pins
+	 * the Big cluster runqueue to max capacity for all framework threads.
+	 * Cap it to 0 so system tasks behave like top-app/foreground tasks.
+	 */
+	if (clamp_id == UCLAMP_MIN && of_css(of)->cgroup &&
+	    of_css(of)->cgroup->kn &&
+	    !strcmp(of_css(of)->cgroup->kn->name, "system")) {
+		req.util = 0;
+		req.percent = 0;
+	}
+
 	if (tg->uclamp_req[clamp_id].value != req.util)
 		uclamp_se_set(&tg->uclamp_req[clamp_id], req.util, false);
 
