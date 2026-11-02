@@ -66,6 +66,17 @@ static DEFINE_PER_CPU(struct sugov_cpu, sugov_cpu);
 
 /************************ Governor internals ***********************/
 
+static inline bool sugov_policy_is_idle(struct cpufreq_policy *policy)
+{
+	unsigned int cpu;
+
+	for_each_cpu(cpu, policy->cpus) {
+		if (cpu_rq(cpu)->nr_running)
+			return false;
+	}
+	return true;
+}
+
 static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 {
 	s64 delta_ns;
@@ -109,6 +120,14 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 	if (sg_policy->work_in_progress)
 		return true;
 
+	/*
+	 * If all CPUs in the policy have no running tasks, allow immediate frequency
+	 * reduction without rate-limit delay so idle cores can drop to min OPP
+	 * before halting ticks or entering deep sleep (WFI).
+	 */
+	if (sugov_policy_is_idle(sg_policy->policy))
+		return true;
+
 	/* No need to recalculate next freq for min_rate_limit_us
 	 * at least. However we might still decide to further rate
 	 * limit once frequency change direction is decided, according
@@ -123,6 +142,15 @@ static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 				     unsigned int next_freq)
 {
 	s64 delta_ns;
+
+	/*
+	 * When the cluster is idle and dropping to min frequency, allow immediate
+	 * transition without waiting for down_rate_delay_ns. Otherwise cores enter
+	 * WFI while locked at high OPP and cannot step down until the next wakeup.
+	 */
+	if (next_freq <= sg_policy->policy->min &&
+	    sugov_policy_is_idle(sg_policy->policy))
+		return false;
 
 	delta_ns = time - sg_policy->last_freq_update_time;
 
@@ -226,10 +254,21 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 
 	trace_android_vh_map_util_freq(util, freq, max, &next_freq, policy,
 			&sg_policy->need_freq_update);
-	if (next_freq)
-		freq = next_freq;
-	else
+	if (next_freq) {
+		unsigned long raw_freq = map_util_freq(util, freq, max);
+
+		/*
+		 * If vendor hook specifies next_freq, honor it for performance,
+		 * but do not allow an artificial high floor (>=1000 MHz) when
+		 * utilization is genuinely low (<15% of max) so low OPPs (725-900MHz) remain accessible.
+		 */
+		if (raw_freq < next_freq && (util * 100 < max * 15))
+			freq = max_t(unsigned long, raw_freq, policy->min);
+		else
+			freq = next_freq;
+	} else {
 		freq = map_util_freq(util, freq, max);
+	}
 
 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
 		return sg_policy->next_freq;
@@ -499,6 +538,16 @@ static void sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time)
 	 * into the same scale so we can compare.
 	 */
 	boost = (sg_cpu->iowait_boost * sg_cpu->max) >> SCHED_CAPACITY_SHIFT;
+
+	/*
+	 * Avoid aggressive IO-wait ramp to max capacity on big cores for light
+	 * tasks (e.g. sysfs/procfs pollers like DevCheck or CPU monitor apps).
+	 * If CFS utilization is below 15% of capacity, cap the boost
+	 * to half capacity (max >> 1) so low OPPs (725-1000 MHz) remain accessible.
+	 */
+	if (sg_cpu->util < (sg_cpu->max * 15 / 100))
+		boost = min(boost, sg_cpu->max >> 1);
+
 	if (sg_cpu->util < boost)
 		sg_cpu->util = boost;
 	sg_cpu->util = uclamp_rq_util_with(cpu_rq(sg_cpu->cpu), sg_cpu->util, NULL);
