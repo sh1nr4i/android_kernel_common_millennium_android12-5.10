@@ -219,10 +219,10 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 		freq = policy->cpuinfo.max_freq;
 	else
 		/*
-		 * Apply a 25% margin so that we select a higher frequency than
+		 * Apply a 12.5% margin so that we select a higher frequency than
 		 * the current one before the CPU is fully busy:
 		 */
-		freq = policy->cur + (policy->cur >> 2);
+		freq = policy->cur + (policy->cur >> 3);
 
 	trace_android_vh_map_util_freq(util, freq, max, &next_freq, policy,
 			&sg_policy->need_freq_update);
