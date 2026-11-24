@@ -516,6 +516,114 @@ static inline void erofs_fixup_camera_page(struct page *page)
 		}
 		kunmap_atomic(kaddr);
 	}
+
+	/* Fix 3: libmtkcam_3rdparty.customer.so (i_size == 652416)
+	 * On custom ROMs missing vendor camera MNN models and OpenCL SR buffers,
+	 * Portrait (libfacesattribute.so), Sky Shop (libmagicsky_64.so), Super Resolution
+	 * (lib_sr_indep_ocl.so), and ASD (libtf_asd_lib.so) crash camerahalserver with
+	 * NULL-pointer SIGSEGV / SIGABRT ("Can't connect to the camera").
+	 * Default their 3rd-party algo gates to 0 (disabled) instead of -1 (auto-enable).
+	 */
+	if (inode->i_size == 652416) {
+		switch (page->index) {
+		case 71: /* 0x472b4: SuperResolutionMode #1 */
+			kaddr = kmap_atomic(page);
+			insn = (u32 *)(kaddr + 0x2b4);
+			if (insn[0] == 0x12800001 && insn[1] == 0x94011602) {
+				insn[0] = 0x52800001; /* mov w1, #0 */
+				flush_dcache_page(page);
+				pr_info("chihiro_kernel: patched 3rdparty SuperResolutionMode #1 in EROFS pagecache!\n");
+			}
+			kunmap_atomic(kaddr);
+			break;
+		case 74: /* 0x4a8cc: magicskytype #1 */
+			kaddr = kmap_atomic(page);
+			insn = (u32 *)(kaddr + 0x8cc);
+			if (insn[0] == 0x94010a21 && insn[1] == 0x37f80300) {
+				insn[0] = 0x52800000; /* mov w0, #0 */
+				flush_dcache_page(page);
+				pr_info("chihiro_kernel: patched 3rdparty magicskytype #1 in EROFS pagecache!\n");
+			}
+			kunmap_atomic(kaddr);
+			break;
+		case 77: /* 0x4d1c8 SR#2, 0x4d324 sky#2, 0x4dd70 SR#3, 0x4df60 sky#3 */
+			kaddr = kmap_atomic(page);
+			{
+				bool dirty = false;
+
+				insn = (u32 *)(kaddr + 0x1c8);
+				if (insn[0] == 0x12800001 && insn[1] == 0x9400fe3d) {
+					insn[0] = 0x52800001;
+					dirty = true;
+				}
+				insn = (u32 *)(kaddr + 0x324);
+				if (insn[0] == 0x9400ff8b && insn[1] == 0x36f823c0) {
+					insn[0] = 0x52800000;
+					dirty = true;
+				}
+				insn = (u32 *)(kaddr + 0xd70);
+				if (insn[0] == 0x12800001 && insn[1] == 0x9400fb53) {
+					insn[0] = 0x52800001;
+					dirty = true;
+				}
+				insn = (u32 *)(kaddr + 0xf60);
+				if (insn[0] == 0x9400fc7c && insn[1] == 0x36f84bc0) {
+					insn[0] = 0x52800000;
+					dirty = true;
+				}
+				if (dirty) {
+					flush_dcache_page(page);
+					pr_info("chihiro_kernel: patched 3rdparty SR/magicsky (page 77) in EROFS pagecache!\n");
+				}
+			}
+			kunmap_atomic(kaddr);
+			break;
+		case 86: /* 0x562bc gendermode (Portrait crash), 0x5651c asdmode */
+			kaddr = kmap_atomic(page);
+			{
+				bool dirty = false;
+
+				insn = (u32 *)(kaddr + 0x2bc);
+				if (insn[0] == 0x12800001 && insn[1] == 0x9400da00) {
+					insn[0] = 0x52800001; /* mov w1, #0 */
+					dirty = true;
+				}
+				insn = (u32 *)(kaddr + 0x51c);
+				if (insn[0] == 0x12800001 && insn[1] == 0x9400d968) {
+					insn[0] = 0x52800001; /* mov w1, #0 */
+					dirty = true;
+				}
+				if (dirty) {
+					flush_dcache_page(page);
+					pr_info("chihiro_kernel: patched 3rdparty gendermode+asdmode in EROFS pagecache!\n");
+				}
+			}
+			kunmap_atomic(kaddr);
+			break;
+		case 87: /* 0x574c8: magicskytype #4 (Sky Shop streaming crash) */
+			kaddr = kmap_atomic(page);
+			insn = (u32 *)(kaddr + 0x4c8);
+			if (insn[0] == 0x9400d722 && insn[1] == 0x36f84a20) {
+				insn[0] = 0x52800000; /* mov w0, #0 */
+				flush_dcache_page(page);
+				pr_info("chihiro_kernel: patched 3rdparty magicskytype #4 in EROFS pagecache!\n");
+			}
+			kunmap_atomic(kaddr);
+			break;
+		case 88: /* 0x58c28: genderdetect */
+			kaddr = kmap_atomic(page);
+			insn = (u32 *)(kaddr + 0xc28);
+			if (insn[0] == 0x9400d14a && insn[1] == 0x2a0003f6) {
+				insn[0] = 0x52800000; /* mov w0, #0 */
+				flush_dcache_page(page);
+				pr_info("chihiro_kernel: patched 3rdparty genderdetect in EROFS pagecache!\n");
+			}
+			kunmap_atomic(kaddr);
+			break;
+		default:
+			break;
+		}
+	}
 }
 
 #endif	/* __EROFS_INTERNAL_H */
