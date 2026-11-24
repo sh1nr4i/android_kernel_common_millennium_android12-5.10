@@ -1138,6 +1138,9 @@ uclamp_tg_restrict(struct task_struct *p, enum uclamp_id clamp_id)
  *   group or in an autogroup
  * - the system default clamp value, defined by the sysadmin
  */
+extern int chihiro_primary_big_cpu(struct task_struct *p);
+extern bool chihiro_thermal_boost_allowed(void);
+
 static inline struct uclamp_se
 uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 {
@@ -1145,6 +1148,24 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 	struct uclamp_se uc_max = uclamp_default[clamp_id];
 	struct uclamp_se uc_eff;
 	int ret = 0;
+
+	/*
+	 * Shield primary game render threads (UnityMain, UnityGfxDeviceW, etc.)
+	 * from secret fpsgo/tran_fre UCLAMP_MAX throttling and ensure high
+	 * UCLAMP_MIN demand while SoC thermal headroom is safe (< 82C).
+	 */
+	if (chihiro_primary_big_cpu(p) && chihiro_thermal_boost_allowed()) {
+		if (clamp_id == UCLAMP_MAX) {
+			uclamp_se_set(&uc_eff, SCHED_CAPACITY_SCALE, false);
+			return uc_eff;
+		}
+		if (clamp_id == UCLAMP_MIN) {
+			unsigned int val = max_t(unsigned int, uc_req.value, 800U);
+
+			uclamp_se_set(&uc_eff, val, false);
+			return uc_eff;
+		}
+	}
 
 	trace_android_rvh_uclamp_eff_get(p, clamp_id, &uc_max, &uc_eff, &ret);
 	if (ret)
@@ -1884,8 +1905,17 @@ struct migration_arg {
 static struct rq *__migrate_task(struct rq *rq, struct rq_flags *rf,
 				 struct task_struct *p, int dest_cpu)
 {
+	int primary_cpu;
+
 	/* Affinity changed (again). */
 	if (!is_cpu_allowed(p, dest_cpu))
+		return rq;
+
+	/* Never let stop-machine migration demote primary render threads to Little */
+	primary_cpu = chihiro_primary_big_cpu(p);
+	if (primary_cpu && cpu_of(rq) == primary_cpu &&
+	    dest_cpu < 6 && cpu_active(primary_cpu) &&
+	    is_cpu_allowed(p, primary_cpu))
 		return rq;
 
 	update_rq_clock(rq);

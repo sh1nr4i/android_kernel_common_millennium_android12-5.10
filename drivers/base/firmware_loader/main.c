@@ -563,6 +563,47 @@ fw_get_filesystem_firmware(struct device *device, struct fw_priv *fw_priv,
 		} else {
 			dev_dbg(device, "direct-loading %s\n",
 				fw_priv->fw_name);
+			/*
+			 * Chihiro Wi-Fi Signal Stability & Efficiency Patch:
+			 * Enable LDPC/STBC and tune 5GHz EDCCA to avoid false TX
+			 * deferrals while preserving stock Wi-Fi power-save
+			 * (AdvPws, Uapsd, WowOffMdtim=3) for minimal idle drain.
+			 */
+			if (fw_priv->fw_name && strstr(fw_priv->fw_name, "wifi.cfg") &&
+			    buffer && size > 0) {
+				static const char chihiro_wifi_patch[] =
+					"\n# Chihiro Wi-Fi Stability & Power-Efficient Override\n"
+					"LdpcTx 1\n"
+					"LdpcRx 1\n"
+					"StbcTx 1\n"
+					"StbcRx 1\n"
+					"EdccaTh5gBw20 0xFFC2\n"
+					"EdccaTh5gBw40 0xFFC2\n"
+					"EdccaTh5gBw80 0xFFC2\n"
+					"AdapScan 1\n"
+					"Sta2gBw 1\n";
+				const size_t patch_len = sizeof(chihiro_wifi_patch) - 1;
+
+				if (!fw_priv->allocated_size) {
+					char *patched = vmalloc(size + patch_len + 1);
+
+					if (patched) {
+						memcpy(patched, buffer, size);
+						memcpy(patched + size, chihiro_wifi_patch, patch_len);
+						patched[size + patch_len] = '\0';
+						vfree(buffer);
+						buffer = patched;
+						size += patch_len;
+						pr_info("chihiro: patched %s (+%zu bytes) for low-latency Wi-Fi\n",
+							fw_priv->fw_name, patch_len);
+					}
+				} else if (size + patch_len <= fw_priv->allocated_size) {
+					memcpy((char *)buffer + size, chihiro_wifi_patch, patch_len);
+					size += patch_len;
+					pr_info("chihiro: patched %s in-place (+%zu bytes) for low-latency Wi-Fi\n",
+						fw_priv->fw_name, patch_len);
+				}
+			}
 			if (!fw_priv->data)
 				fw_priv->data = buffer;
 			fw_priv->size = size;

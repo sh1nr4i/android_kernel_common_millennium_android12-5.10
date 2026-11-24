@@ -28,16 +28,15 @@
 /*
  * See Documentation/block/deadline-iosched.rst
  */
-static const int read_expire = HZ / 2;  /* max time before a read is submitted. */
-static const int write_expire = 5 * HZ; /* ditto for writes, these limits are SOFT! */
+static const int read_expire = HZ / 8;  /* 125ms: fast flash read dispatch */
+static const int write_expire = HZ;     /* 1000ms: prevent dirty writeback stalls */
 /*
  * Time after which to dispatch lower priority requests even if higher
  * priority requests are pending.
  */
 static const int aging_expire = 10 * HZ;
-static const int writes_starved = 2;    /* max times reads can starve a write */
-static const int fifo_batch = 16;       /* # of sequential requests treated as one
-				     by the above parameters. For throughput. */
+static const int writes_starved = 4;    /* prioritize interactive/game reads */
+static const int fifo_batch = 8;        /* tighter batch for lower tail latency */
 
 enum dd_data_dir {
 	DD_READ		= READ,

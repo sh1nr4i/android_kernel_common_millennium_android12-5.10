@@ -188,6 +188,12 @@ void __init of_core_init(void)
 		proc_symlink("device-tree", NULL, "/sys/firmware/devicetree/base");
 }
 
+static struct property dummy_ta_status_prop = {
+	.name = (char *)"allow_not_check_ta_status",
+	.length = 0,
+	.value = NULL,
+};
+
 static struct property *__of_find_property(const struct device_node *np,
 					   const char *name, int *lenp)
 {
@@ -195,6 +201,17 @@ static struct property *__of_find_property(const struct device_node *np,
 
 	if (!np)
 		return NULL;
+
+	if (name) {
+		if (strcmp(name, "judge_cable") == 0 ||
+		    strcmp(name, "enable_pcb_tml") == 0)
+			return NULL;
+		if (strcmp(name, "allow_not_check_ta_status") == 0) {
+			if (lenp)
+				*lenp = 0;
+			return &dummy_ta_status_prop;
+		}
+	}
 
 	for (pp = np->properties; pp; pp = pp->next) {
 		if (of_prop_cmp(pp->name, name) == 0) {

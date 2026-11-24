@@ -346,17 +346,36 @@ static ssize_t pde_write(struct proc_dir_entry *pde, struct file *file, const ch
 	return -EIO;
 }
 
+extern void chihiro_charging_sysfs_write(const char *name, const char *buf);
+
 static ssize_t proc_reg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
 	struct proc_dir_entry *pde = PDE(file_inode(file));
 	ssize_t rv = -EIO;
+	char kbuf[32];
+	bool is_chg_proc = false;
+
+	if (pde && pde->name && buf && count > 0) {
+		if (!strcmp(pde->name, "limit_current") ||
+		    !strcmp(pde->name, "chihiro_charge_limit")) {
+			size_t len = min(count, sizeof(kbuf) - 1);
+			if (!copy_from_user(kbuf, buf, len)) {
+				kbuf[len] = '\0';
+				is_chg_proc = true;
+			}
+		}
+	}
 
 	if (pde_is_permanent(pde)) {
-		return pde_write(pde, file, buf, count, ppos);
+		rv = pde_write(pde, file, buf, count, ppos);
 	} else if (use_pde(pde)) {
 		rv = pde_write(pde, file, buf, count, ppos);
 		unuse_pde(pde);
 	}
+
+	if (is_chg_proc)
+		chihiro_charging_sysfs_write(pde->name, kbuf);
+
 	return rv;
 }
 

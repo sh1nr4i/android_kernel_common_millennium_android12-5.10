@@ -140,6 +140,117 @@ static void *of_find_property_value_of_size(const struct device_node *np,
  *
  * The out_value is modified only if a valid u32 value can be decoded.
  */
+static void chihiro_override_dt_u32(const char *propname, u32 *out_value)
+{
+	if (!propname || !out_value)
+		return;
+
+	if (strcmp(propname, "pe40_r_cable_3a_lower") == 0 ||
+	    strcmp(propname, "pe40_r_cable_2a_lower") == 0 ||
+	    strcmp(propname, "pe40_r_cable_1a_lower") == 0 ||
+	    strcmp(propname, "cable_imp_threshold") == 0) {
+		*out_value = 2000;
+	} else if (strcmp(propname, "start_soc_max") == 0 ||
+		   strcmp(propname, "pd_stop_battery_soc") == 0 ||
+		   strcmp(propname, "pe40_stop_battery_soc") == 0 ||
+		   strcmp(propname, "ta_stop_battery_soc") == 0) {
+		*out_value = 100;
+	} else if (strcmp(propname, "start_vbat_max") == 0 ||
+		   strcmp(propname, "vbat_threshold") == 0 ||
+		   strcmp(propname, "vbat_cv") == 0 ||
+		   strcmp(propname, "ult_lt_vbat_cv") == 0) {
+		*out_value = 4480;
+	} else if (strcmp(propname, "ult_ht_vbat_cv") == 0 ||
+		   strcmp(propname, "swchg_off_vbat") == 0 ||
+		   strcmp(propname, "force_ta_cv_vbat") == 0) {
+		*out_value = 4450;
+	} else if (strcmp(propname, "tc30_ichg_level_threshold") == 0) {
+		*out_value = 400000;
+	} else if (strcmp(propname, "idvchg_term") == 0) {
+		*out_value = 400;
+	} else if (strcmp(propname, "project_power") == 0 ||
+		   strcmp(propname, "pd_max_watt") == 0 ||
+		   strcmp(propname, "vsys_watt") == 0) {
+		*out_value = 68;
+	} else if (strcmp(propname, "pd_min_watt") == 0) {
+		*out_value = 15;
+	} else if (strcmp(propname, "pd_vbus_upper_bound") == 0 ||
+		   strcmp(propname, "pe50_call_ita") == 0 ||
+		   strcmp(propname, "lcd_on_ita") == 0) {
+		*out_value = 12000;
+	} else if (strcmp(propname, "pd_vbus_low_bound") == 0) {
+		*out_value = 4500;
+	} else if (strcmp(propname, "swchg_aicr") == 0 ||
+		   strcmp(propname, "dv2_ffc_ibat_low") == 0 ||
+		   strcmp(propname, "dv2_ffc_ibat_mid") == 0 ||
+		   strcmp(propname, "dv2_ffc_ibat_high") == 0) {
+		*out_value = 3400;
+	} else if (strcmp(propname, "swchg_ichg") == 0) {
+		*out_value = 6000;
+	} else if (strcmp(propname, "swchg_aicr_ss_init") == 0) {
+		*out_value = 500;
+	} else if (strcmp(propname, "swchg_aicr_ss_step") == 0) {
+		*out_value = 200;
+	} else if (strcmp(propname, "pcb_cur_step_one") == 0 ||
+		   strcmp(propname, "pcb_cur_step_two") == 0 ||
+		   strcmp(propname, "kom_pcb_cur_step_one") == 0 ||
+		   strcmp(propname, "kom_pcb_cur_step_two") == 0 ||
+		   strcmp(propname, "wireless_pcb_cur_step_one") == 0 ||
+		   strcmp(propname, "wireless_pcb_cur_step_two") == 0) {
+		*out_value = 0;
+	} else if (strcmp(propname, "ac_charger_current") == 0 ||
+		   strcmp(propname, "ta_ac_charger_current") == 0 ||
+		   strcmp(propname, "normal_ta_ac_charger_current") == 0 ||
+		   strcmp(propname, "sc_charger_current") == 0 ||
+		   strcmp(propname, "chg_iter_current") == 0 ||
+		   strcmp(propname, "max_dmivr_charger_current") == 0 ||
+		   strcmp(propname, "dcs_chg1_charger_current") == 0 ||
+		   strcmp(propname, "dcs_chg2_charger_current") == 0 ||
+		   strcmp(propname, "pe40_single_charger_current") == 0 ||
+		   strcmp(propname, "pe40_dual_charger_chg1_current") == 0 ||
+		   strcmp(propname, "pe40_dual_charger_chg2_current") == 0 ||
+		   strcmp(propname, "ichg") == 0 ||
+		   strcmp(propname, "pcb_min_chg_cur") == 0 ||
+		   strcmp(propname, "kom_pcb_min_chg_cur") == 0 ||
+		   strcmp(propname, "wireless_pcb_min_chg_cur") == 0 ||
+		   strcmp(propname, "jeita_t0_to_t1_chg_cur") == 0 ||
+		   strcmp(propname, "jeita_t1_to_t2_chg_cur") == 0 ||
+		   strcmp(propname, "jeita_t2_to_t3_chg_cur") == 0 ||
+		   strcmp(propname, "jeita_t3_to_t4_chg_cur") == 0) {
+		*out_value = 6000000;
+	} else if (strcmp(propname, "ac_charger_input_current") == 0 ||
+		   strcmp(propname, "sc_input_current") == 0 ||
+		   strcmp(propname, "dcs_input_current") == 0 ||
+		   strcmp(propname, "tc30_switch_5v_current") == 0 ||
+		   strcmp(propname, "charging_host_charger_current") == 0 ||
+		   strcmp(propname, "non_std_ac_charger_current") == 0 ||
+		   strcmp(propname, "apple_2_1a_charger_current") == 0 ||
+		   strcmp(propname, "apple_1_0a_charger_current") == 0 ||
+		   strcmp(propname, "ta_ac_12v_input_current") == 0 ||
+		   strcmp(propname, "ta_ac_9v_input_current") == 0 ||
+		   strcmp(propname, "ta_ac_7v_input_current") == 0 ||
+		   strcmp(propname, "ta_ac_5v_input_current") == 0 ||
+		   strcmp(propname, "pe40_single_charger_input_current") == 0 ||
+		   strcmp(propname, "pe40_dual_charger_input_current") == 0 ||
+		   strcmp(propname, "aicr") == 0 ||
+		   strcmp(propname, "jeita_above_t4_chg_cur") == 0 ||
+		   strcmp(propname, "jeita_t0_to_t1_input_cur") == 0 ||
+		   strcmp(propname, "jeita_t1_to_t2_input_cur") == 0 ||
+		   strcmp(propname, "jeita_t2_to_t3_input_cur") == 0 ||
+		   strcmp(propname, "jeita_t3_to_t4_input_cur") == 0 ||
+		   strcmp(propname, "jeita_above_t4_input_cur") == 0) {
+		*out_value = 3400000;
+	} else if (strcmp(propname, "mivr") == 0) {
+		*out_value = 4200000;
+	} else if (strcmp(propname, "pcb_temp_step_one") == 0 ||
+		   strcmp(propname, "kom_pcb_temp_step_one") == 0) {
+		*out_value = 65;
+	} else if (strcmp(propname, "pcb_temp_step_two") == 0 ||
+		   strcmp(propname, "kom_pcb_temp_step_two") == 0) {
+		*out_value = 70;
+	}
+}
+
 int of_property_read_u32_index(const struct device_node *np,
 				       const char *propname,
 				       u32 index, u32 *out_value)
@@ -153,6 +264,11 @@ int of_property_read_u32_index(const struct device_node *np,
 		return PTR_ERR(val);
 
 	*out_value = be32_to_cpup(((__be32 *)val) + index);
+
+	/* 68W SuperCharge DT Overrides */
+	if (index == 0)
+		chihiro_override_dt_u32(propname, out_value);
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(of_property_read_u32_index);
@@ -315,7 +431,7 @@ int of_property_read_variable_u32_array(const struct device_node *np,
 			       const char *propname, u32 *out_values,
 			       size_t sz_min, size_t sz_max)
 {
-	size_t sz, count;
+	size_t sz, count, i;
 	const __be32 *val = of_find_property_value_of_size(np, propname,
 						(sz_min * sizeof(*out_values)),
 						(sz_max * sizeof(*out_values)),
@@ -330,8 +446,45 @@ int of_property_read_variable_u32_array(const struct device_node *np,
 		sz /= sizeof(*out_values);
 
 	count = sz;
-	while (count--)
-		*out_values++ = be32_to_cpup(val++);
+	for (i = 0; i < count; i++)
+		out_values[i] = be32_to_cpup(val + i);
+
+	/* 68W SuperCharge Cable Impedance, Thermal & FFC Overrides */
+	if (propname && count > 0) {
+		if (count == 1) {
+			chihiro_override_dt_u32(propname, &out_values[0]);
+		}
+		if (strcmp(propname, "pe40_r_cable_3a_lower") == 0 ||
+		    strcmp(propname, "pe40_r_cable_2a_lower") == 0 ||
+		    strcmp(propname, "pe40_r_cable_1a_lower") == 0 ||
+		    strcmp(propname, "cable_imp_threshold") == 0 ||
+		    strcmp(propname, "rcable_level") == 0 ||
+		    strcmp(propname, "rcable_level_dual") == 0) {
+			for (i = 0; i < count; i++)
+				out_values[i] = 2000;
+		} else if (strcmp(propname, "rcable_irlmt") == 0 ||
+			   strcmp(propname, "rcable_irlmt_dual") == 0) {
+			for (i = 0; i < count; i++)
+				out_values[i] = 6800;
+		} else if (strcmp(propname, "tbat_curlmt") == 0 ||
+			   strcmp(propname, "tpcb_curlmt") == 0 ||
+			   strcmp(propname, "tdvchg_curlmt") == 0 ||
+			   strcmp(propname, "tswchg_curlmt") == 0 ||
+			   strcmp(propname, "tta_curlmt") == 0) {
+			/* In pe50_get_ita_lmt, *_curlmt[i] is subtracted from ita_max (0 = no reduction) */
+			for (i = 0; i < count; i++) {
+				if (out_values[i] != 0xffffffff)
+					out_values[i] = 0;
+			}
+		} else if (strcmp(propname, "dv2_ffc_ibat") == 0 ||
+			   strcmp(propname, "dv2_ffc_gera_ibat_h") == 0 ||
+			   strcmp(propname, "dv2_ffc_gera_ibat_m") == 0 ||
+			   strcmp(propname, "dv2_ffc_gera_ibat_l") == 0) {
+			static const u32 ffc_boost[5] = { 3400, 3300, 3100, 2900, 2700 };
+			for (i = 0; i < count; i++)
+				out_values[i] = (i < 5) ? ffc_boost[i] : 2700;
+		}
+	}
 
 	return sz;
 }

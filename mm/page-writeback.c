@@ -100,9 +100,9 @@ int vm_dirty_ratio = 30;
 unsigned long vm_dirty_bytes;
 
 /*
- * The interval between `kupdate'-style writebacks
+ * The interval between `kupdate'-style writebacks (15s for lower idle wakeups)
  */
-unsigned int dirty_writeback_interval = 3 * 100; /* centiseconds */
+unsigned int dirty_writeback_interval = 15 * 100; /* centiseconds */
 
 EXPORT_SYMBOL_GPL(dirty_writeback_interval);
 

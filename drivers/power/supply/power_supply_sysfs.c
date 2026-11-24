@@ -271,7 +271,9 @@ static ssize_t power_supply_show_property(struct device *dev,
 	union power_supply_propval value;
 
 	if (psp == POWER_SUPPLY_PROP_TYPE) {
-		value.intval = psy->desc->type;
+		ret = power_supply_get_property(psy, psp, &value);
+		if (ret < 0)
+			value.intval = psy->desc->type;
 	} else {
 		ret = power_supply_get_property(psy, psp, &value);
 

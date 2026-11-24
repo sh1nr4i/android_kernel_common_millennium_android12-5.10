@@ -21,6 +21,13 @@
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/thermal.h>
+#include <linux/kallsyms.h>
+#include <linux/proc_fs.h>
+#include <linux/uaccess.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 #include "power_supply.h"
 
 /* exported for the APM Power driver, APM emulation */
@@ -957,17 +964,810 @@ int power_supply_batinfo_ocv2cap(struct power_supply_battery_info *info,
 }
 EXPORT_SYMBOL_GPL(power_supply_batinfo_ocv2cap);
 
+static bool chihiro_is_sdp_connected(struct power_supply *caller_psy)
+{
+	union power_supply_propval uval, oval;
+
+	if (caller_psy && caller_psy->desc && caller_psy->desc->get_property) {
+		if (caller_psy->desc->get_property(caller_psy, POWER_SUPPLY_PROP_ONLINE, &oval) == 0 &&
+		    oval.intval == 0)
+			return false;
+		if (caller_psy->desc->get_property(caller_psy, POWER_SUPPLY_PROP_USB_TYPE, &uval) == 0) {
+			if (uval.intval == POWER_SUPPLY_USB_TYPE_SDP ||
+			    uval.intval == POWER_SUPPLY_USB_TYPE_CDP)
+				return true;
+		}
+	}
+
+	{
+		struct power_supply *chg = power_supply_get_by_name("charger");
+		if (chg) {
+			int ret = -1;
+			if (chg->desc && chg->desc->get_property) {
+				if (chg->desc->get_property(chg, POWER_SUPPLY_PROP_ONLINE, &oval) == 0 &&
+				    oval.intval == 0) {
+					power_supply_put(chg);
+					return false;
+				}
+				ret = chg->desc->get_property(chg, POWER_SUPPLY_PROP_USB_TYPE, &uval);
+			}
+			power_supply_put(chg);
+			if (ret == 0 && (uval.intval == POWER_SUPPLY_USB_TYPE_SDP ||
+					 uval.intval == POWER_SUPPLY_USB_TYPE_CDP))
+				return true;
+		}
+	}
+	return false;
+}
+
+int chihiro_charge_limit_ua = 0;
+EXPORT_SYMBOL_GPL(chihiro_charge_limit_ua);
+
+static bool chihiro_bypass_active = false;
+static bool chihiro_user_mode_locked = false;
+static int *chihiro_memtest_cur_ptr = NULL;
+static int *chihiro_kick_to_80_ptr = NULL;
+static int *chihiro_monkey_flag_ptr = NULL;
+static int *chihiro_max_temp_delta_ptr = NULL;
+static int *chihiro_ibat_temp_cur_ptr = NULL;
+
+static void chihiro_sync_mtk_charger_info(void *info, bool wake_charger, struct power_supply *mchg_psy)
+{
+	u32 bypass_chg;
+	u8 cmd_dischg;
+	int i, k;
+
+	if (!info)
+		return;
+
+	if (!chihiro_memtest_cur_ptr)
+		chihiro_memtest_cur_ptr = (int *)kallsyms_lookup_name("memtest_input_current");
+	if (!chihiro_kick_to_80_ptr)
+		chihiro_kick_to_80_ptr = (int *)kallsyms_lookup_name("kick_to_80");
+	if (!chihiro_monkey_flag_ptr)
+		chihiro_monkey_flag_ptr = (int *)kallsyms_lookup_name("monkey_flag");
+	if (!chihiro_max_temp_delta_ptr)
+		chihiro_max_temp_delta_ptr = (int *)kallsyms_lookup_name("g_max_temp_delta");
+	if (!chihiro_ibat_temp_cur_ptr)
+		chihiro_ibat_temp_cur_ptr = (int *)kallsyms_lookup_name("g_ibat_temp_cur");
+
+	bypass_chg = *(u32 *)((char *)info + 144);
+	cmd_dischg = *(u8 *)((char *)info + 2436);
+
+	if (chihiro_bypass_active ||
+	    (!chihiro_user_mode_locked && (bypass_chg == 1 || cmd_dischg == 1))) {
+		if (chihiro_memtest_cur_ptr)
+			*chihiro_memtest_cur_ptr = 0;
+
+		*(u8 *)((char *)info + 0xc80) = 0; /* Disable HV pumps during bypass */
+
+		for (i = 0; i < 10; i++) {
+			void *alg = *(void **)((char *)info + 0xc18 + i * 8);
+			u32 alg_id;
+			if (!alg)
+				continue;
+			alg_id = *(u32 *)((char *)alg + 0x6cc);
+			if (alg_id == 0x10) {
+				void *pe5_drv = *(void **)((char *)alg + 0x6b8);
+				void *pe5_info = pe5_drv ? *(void **)((char *)pe5_drv + 0x18) : NULL;
+				if (pe5_info) {
+					*(u32 *)((char *)pe5_info + 0x33c) = 1;
+					if (*(u8 *)((char *)pe5_info + 0x14c) != 0 &&
+					    *(u32 *)((char *)pe5_info + 0x2e8) != 5) {
+						smp_store_release((u32 *)((char *)pe5_info + 0x110), 1);
+						smp_store_release((u32 *)((char *)pe5_info + 0x108), 1);
+						wake_up((wait_queue_head_t *)((char *)pe5_info + 0xf0));
+					}
+				}
+			}
+		}
+
+		if (wake_charger) {
+			*(u8 *)((char *)info + 0x590) = 1;
+			wake_up((wait_queue_head_t *)((char *)info + 0x578));
+		}
+		return;
+	}
+
+	/* Ensure charger is not stuck in bypass/discharge/80%-cutoff state */
+	*(u32 *)((char *)info + 136) = 0;   /* tran_aichg_disable_charger = 0 */
+	*(u32 *)((char *)info + 144) = 0;   /* bypass_charger = 0 */
+	*(u32 *)((char *)info + 148) = 100; /* bypass_energy = 100 */
+	*(u8 *)((char *)info + 2436) = 0;   /* cmd_discharging = 0 */
+	*(u8 *)((char *)info + 0x98d) = 0;
+	if (chihiro_kick_to_80_ptr)
+		*chihiro_kick_to_80_ptr = 0;
+	if (chihiro_monkey_flag_ptr)
+		*chihiro_monkey_flag_ptr = 0;
+
+	if (chihiro_charge_limit_ua == 1000000 || chihiro_charge_limit_ua == 2000000) {
+		int limit_ma = (chihiro_charge_limit_ua == 1000000) ? 1000 : 2000;
+
+		if (chihiro_memtest_cur_ptr)
+			*chihiro_memtest_cur_ptr = limit_ma;
+
+		/* Disable HV charge pumps (pe50/tc30) and force 5V buck charger at 5W/10W */
+		*(u8 *)((char *)info + 0xc80) = 0; /* enable_hv_charging = 0 */
+		*(u8 *)((char *)info + 0xf1e) = 0; /* allow swchg chg1_dev */
+		*(int *)((char *)info + 272) = chihiro_charge_limit_ua;
+		*(int *)((char *)info + 276) = chihiro_charge_limit_ua;
+		*(int *)((char *)info + 284) = chihiro_charge_limit_ua;
+		*(int *)((char *)info + 288) = chihiro_charge_limit_ua;
+		*(int *)((char *)info + 300) = -1;
+		*(int *)((char *)info + 452) = chihiro_charge_limit_ua;
+		*(int *)((char *)info + 456) = chihiro_charge_limit_ua;
+		*(int *)((char *)info + 2836) = chihiro_charge_limit_ua;
+		*(int *)((char *)info + 2840) = chihiro_charge_limit_ua;
+		*(int *)((char *)info + 0xd8c) = chihiro_charge_limit_ua;
+
+		for (i = 0; i < 10; i++) {
+			void *alg = *(void **)((char *)info + 0xc18 + i * 8);
+			u32 alg_id;
+			if (!alg)
+				continue;
+			alg_id = *(u32 *)((char *)alg + 0x6cc);
+			if (alg_id == 0x10) {
+				void *pe5_drv = *(void **)((char *)alg + 0x6b8);
+				void *pe5_info = pe5_drv ? *(void **)((char *)pe5_drv + 0x18) : NULL;
+				if (pe5_info) {
+					*(u32 *)((char *)pe5_info + 0x33c) = 1;
+					*(int *)((char *)pe5_info + 0x304) = limit_ma;
+					*(int *)((char *)pe5_info + 0x308) = limit_ma;
+					if (*(u8 *)((char *)pe5_info + 0x14c) != 0 &&
+					    *(u32 *)((char *)pe5_info + 0x2e8) != 5) {
+						smp_store_release((u32 *)((char *)pe5_info + 0x110), 1);
+						smp_store_release((u32 *)((char *)pe5_info + 0x108), 1);
+						wake_up((wait_queue_head_t *)((char *)pe5_info + 0xf0));
+					}
+				}
+			}
+		}
+	} else {
+		/* FAST 68W SuperCharge: Clear memtest_input_current, thermal & 80% SoC limits */
+		if (chihiro_memtest_cur_ptr)
+			*chihiro_memtest_cur_ptr = 0;
+		if (chihiro_max_temp_delta_ptr)
+			*chihiro_max_temp_delta_ptr = 0;
+		if (chihiro_ibat_temp_cur_ptr &&
+		    *chihiro_ibat_temp_cur_ptr > 0 &&
+		    *chihiro_ibat_temp_cur_ptr < 6000000)
+			*chihiro_ibat_temp_cur_ptr = 6000000;
+
+		*(u8 *)((char *)info + 0xc80) = 1; /* enable_hv_charging = 1 */
+		*(u8 *)((char *)info + 0xd68) = 0; /* Disable SmartCharging 80% cap */
+		*(int *)((char *)info + 0xd70) = -1;
+		*(int *)((char *)info + 284) = -1;
+		*(int *)((char *)info + 288) = -1;
+		*(int *)((char *)info + 300) = -1;
+		*(int *)((char *)info + 328) = -1;
+		*(int *)((char *)info + 332) = -1;
+		*(int *)((char *)info + 372) = -1;
+		*(int *)((char *)info + 0xd8c) = -1;
+		*(int *)((char *)info + 272) = 3400000;
+		*(int *)((char *)info + 276) = 6000000;
+		*(int *)((char *)info + 2836) = 6000000;
+		*(int *)((char *)info + 2840) = 3400000;
+
+		for (i = 0; i < 10; i++) {
+			void *alg = *(void **)((char *)info + 0xc18 + i * 8);
+			u32 alg_id;
+			if (!alg)
+				continue;
+			alg_id = *(u32 *)((char *)alg + 0x6cc);
+			if (alg_id == 0x10) {
+				void *pe5_drv = *(void **)((char *)alg + 0x6b8);
+				void *pe5_desc = pe5_drv ? *(void **)((char *)pe5_drv + 0x10) : NULL;
+				void *pe5_info = pe5_drv ? *(void **)((char *)pe5_drv + 0x18) : NULL;
+				if (pe5_info) {
+					u32 base_ita = *(u32 *)((char *)pe5_info + 0x2ac);
+					*(u8 *)((char *)pe5_info + 0x14c) = 1; /* inited = 1 */
+					*(u32 *)((char *)pe5_info + 0x110) = 0;
+					*(u32 *)((char *)pe5_info + 0x33c) = 0;
+					*(int *)((char *)pe5_info + 0x304) = -1;
+					*(int *)((char *)pe5_info + 0x308) = -1;
+					*(u32 *)((char *)pe5_info + 0x314) = 0;
+					*(u8 *)((char *)pe5_info + 0x330) = 0;
+					*(int *)((char *)pe5_info + 0x414) = -1;
+					if (base_ita > 0)
+						*(u32 *)((char *)pe5_info + 0x2b0) = base_ita;
+					/* Keep PE5.0 thermal state machine in NORMAL (4), valid range 1..7 */
+					*(u32 *)((char *)pe5_info + 0x2ec) = 4;
+					*(u32 *)((char *)pe5_info + 0x2f0) = 4;
+					*(u32 *)((char *)pe5_info + 0x2f4) = 4;
+					*(u32 *)((char *)pe5_info + 0x2f8) = 4;
+					*(u32 *)((char *)pe5_info + 0x2fc) = 4;
+					*(u32 *)((char *)pe5_info + 0x300) = 4;
+					*(u32 *)((char *)pe5_info + 0x3e4) = 4;
+					if (wake_charger) {
+						*(u8 *)((char *)pe5_info + 0x14e) = 0;
+						*(u32 *)((char *)pe5_info + 0x148) = 0;
+						if (*(u32 *)((char *)pe5_info + 0x2e8) != 5) {
+							smp_store_release((u32 *)((char *)pe5_info + 0x108), 1);
+							wake_up((wait_queue_head_t *)((char *)pe5_info + 0xf0));
+						}
+					}
+				}
+				if (pe5_desc) {
+					*(int *)((char *)pe5_desc + 0x1c) = 100;
+					*(u32 *)((char *)pe5_desc + 0xbd0) = 6200;
+					*(u32 *)((char *)pe5_desc + 0xbd8) = 6200;
+					for (k = 0; k < 8; k++)
+						*(u32 *)((char *)pe5_desc + 0xe8 + k * 4) = 0;
+					for (k = 0; k < 9; k++) {
+						*(u32 *)((char *)pe5_desc + 0x954 + k * 4) = 0;
+						*(u32 *)((char *)pe5_desc + 0x99c + k * 4) = 0;
+						*(u32 *)((char *)pe5_desc + 0x9e4 + k * 4) = 0;
+						*(u32 *)((char *)pe5_desc + 0xa2c + k * 4) = 0;
+						*(u32 *)((char *)pe5_desc + 0xa74 + k * 4) = 0;
+						*(u32 *)((char *)pe5_desc + 0xabc + k * 4) = 0;
+						*(u32 *)((char *)pe5_desc + 0xb4c + k * 4) = 0;
+						*(u32 *)((char *)pe5_desc + 0xc18 + k * 4) = 0;
+						*(u32 *)((char *)pe5_desc + 0xc60 + k * 4) = 0;
+					}
+				}
+			} else if (alg_id == 0x4) {
+				void *tc30_info = *(void **)((char *)alg + 0xe0);
+				if (tc30_info && *(int *)((char *)tc30_info + 0xe0) >= 80 &&
+				    *(int *)((char *)tc30_info + 0xe0) < 100)
+					*(int *)((char *)tc30_info + 0xe0) = 100;
+			}
+		}
+	}
+
+	if (wake_charger) {
+		*(u8 *)((char *)info + 0x590) = 1;
+		wake_up((wait_queue_head_t *)((char *)info + 0x578));
+	}
+}
+
+static void chihiro_apply_hardware_limits(void)
+{
+	static bool in_apply = false;
+	struct power_supply *mchg = NULL;
+
+	if (in_apply)
+		return;
+	in_apply = true;
+
+	mchg = power_supply_get_by_name("mtk-master-charger");
+	if (mchg) {
+		void *info = power_supply_get_drvdata(mchg);
+		if (info)
+			chihiro_sync_mtk_charger_info(info, true, mchg);
+		power_supply_put(mchg);
+	}
+
+	in_apply = false;
+}
+
+static struct delayed_work chihiro_rfc_reset_work;
+static struct delayed_work chihiro_usb_unplug_work;
+static bool chihiro_rfc_work_ready = false;
+static bool chihiro_has_reset_rfc = false;
+static unsigned long chihiro_last_rfc_reset_jiffies = 0;
+static unsigned long chihiro_last_unplug_reset_jiffies = 0;
+static int chihiro_auto_rfc_retries = 0;
+
+static noinline __nocfi void chihiro_call_dcp_reset_rfc(void *fn)
+{
+	int (*reset_fn)(void) = (int (*)(void))fn;
+
+	if (reset_fn)
+		reset_fn();
+}
+
+static noinline __nocfi int chihiro_call_int_fn(void *fn)
+{
+	int (*int_fn)(void) = (int (*)(void))fn;
+
+	return int_fn ? int_fn() : -1;
+}
+
+static bool chihiro_is_charger_online(void)
+{
+	struct power_supply *chg = power_supply_get_by_name("charger");
+	union power_supply_propval oval;
+	bool online = false;
+
+	if (chg) {
+		if (chg->desc && chg->desc->get_property &&
+		    chg->desc->get_property(chg, POWER_SUPPLY_PROP_ONLINE, &oval) == 0 &&
+		    oval.intval > 0)
+			online = true;
+		power_supply_put(chg);
+	}
+	return online;
+}
+
+static bool chihiro_is_otg_active(void)
+{
+	static void *otg_plug_fn;
+
+	if (!otg_plug_fn)
+		otg_plug_fn = (void *)kallsyms_lookup_name("tran_get_otg_plug_in");
+	return otg_plug_fn && chihiro_call_int_fn(otg_plug_fn) > 0;
+}
+
+static void chihiro_usb_unplug_workfn(struct work_struct *work)
+{
+	struct power_supply *sw_psy;
+	void *sw_dev;
+	void *reset_fn;
+
+	if (chihiro_is_charger_online() && !chihiro_is_otg_active())
+		return;
+
+	if (chihiro_rfc_work_ready)
+		cancel_delayed_work(&chihiro_rfc_reset_work);
+
+	reset_fn = (void *)kallsyms_lookup_name("dcp_reset_rfc");
+	if (reset_fn)
+		chihiro_call_dcp_reset_rfc(reset_fn);
+
+	sw_psy = power_supply_get_by_name("usb_switch");
+	if (sw_psy) {
+		sw_dev = power_supply_get_drvdata(sw_psy);
+		if (sw_dev) {
+			/* Clear stale RFC/charger state so D+/D- returns to MTK PHY */
+			*(u8 *)((char *)sw_dev + 0x100) = 0;
+			*(u8 *)((char *)sw_dev + 0x178) = 0;
+			*(u8 *)((char *)sw_dev + 0x17a) = 0;
+			*(u32 *)((char *)sw_dev + 0x188) = 0;
+		}
+		power_supply_put(sw_psy);
+	}
+}
+
+static void chihiro_maybe_reset_usb_switch(void)
+{
+	struct power_supply *sw_psy;
+	void *sw_dev;
+	bool need_reset = false;
+
+	if (!chihiro_rfc_work_ready)
+		return;
+	if (chihiro_is_charger_online() && !chihiro_is_otg_active())
+		return;
+	if (chihiro_last_unplug_reset_jiffies != 0 &&
+	    time_before(jiffies, chihiro_last_unplug_reset_jiffies + msecs_to_jiffies(500)))
+		return;
+
+	sw_psy = power_supply_get_by_name("usb_switch");
+	if (sw_psy) {
+		sw_dev = power_supply_get_drvdata(sw_psy);
+		if (sw_dev) {
+			u8 chg_in = *(u8 *)((char *)sw_dev + 0x100);
+			u8 rfc_dcp_ta = *(u8 *)((char *)sw_dev + 0x178);
+			u32 rfc_online = *(u32 *)((char *)sw_dev + 0x188);
+
+			if (chg_in || rfc_dcp_ta || rfc_online)
+				need_reset = true;
+		}
+		power_supply_put(sw_psy);
+	}
+
+	if (need_reset) {
+		chihiro_last_unplug_reset_jiffies = jiffies;
+		schedule_delayed_work(&chihiro_usb_unplug_work, 0);
+	}
+}
+
+static void *chihiro_find_pe5_info(void *info)
+{
+	int i;
+
+	if (!info)
+		return NULL;
+	for (i = 0; i < 10; i++) {
+		void *alg = *(void **)((char *)info + 0xc18 + i * 8);
+		if (alg && *(u32 *)((char *)alg + 0x6cc) == 0x10) {
+			void *pe5_drv = *(void **)((char *)alg + 0x6b8);
+			return pe5_drv ? *(void **)((char *)pe5_drv + 0x18) : NULL;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Re-trigger Infinix 68W RFC handshake in usb_switch when PE5.0 stopped
+ * (e.g. after Slow/Normal/Bypass hardreset or rfc_ta 7-001b -ENXIO) without
+ * requiring a physical USB cable unplug.
+ */
+static void chihiro_rfc_reset_workfn(struct work_struct *work)
+{
+	struct power_supply *mchg = NULL;
+	struct power_supply *sw_psy = NULL;
+	void *info = NULL;
+	void *sw_dev = NULL;
+	void *pe5_info = NULL;
+	bool pe5_running = false;
+	bool need_rehandshake = false;
+	bool rfc_busy = false;
+	int wait_loops;
+
+	if (chihiro_bypass_active || chihiro_charge_limit_ua != 0)
+		return;
+	if (!chihiro_is_charger_online())
+		return;
+
+	mchg = power_supply_get_by_name("mtk-master-charger");
+	if (!mchg)
+		return;
+
+	info = power_supply_get_drvdata(mchg);
+	pe5_info = chihiro_find_pe5_info(info);
+	if (pe5_info) {
+		u32 state = *(u32 *)((char *)pe5_info + 0x2e8);
+		*(u8 *)((char *)pe5_info + 0x14c) = 1; /* inited must stay 1 */
+		if (state != 5)
+			pe5_running = true;
+	}
+	power_supply_put(mchg);
+
+	if (pe5_running)
+		return;
+
+	sw_psy = power_supply_get_by_name("usb_switch");
+	if (sw_psy) {
+		sw_dev = power_supply_get_drvdata(sw_psy);
+		if (sw_dev) {
+			bool is_pd = (*(u8 *)((char *)sw_dev + 0x17a) != 0);
+			bool chg_in = (*(u8 *)((char *)sw_dev + 0x100) != 0);
+			struct work_struct *rfc_work =
+				(struct work_struct *)((char *)sw_dev + 0x8);
+
+			rfc_busy = (work_busy(rfc_work) != 0);
+			if (!is_pd && chg_in && !rfc_busy)
+				need_rehandshake = true;
+		}
+		power_supply_put(sw_psy);
+	}
+
+	/* If usb_switch is already running plug-in detection, wait for it instead of resetting */
+	if (rfc_busy) {
+		for (wait_loops = 0; wait_loops < 12; wait_loops++) {
+			bool busy = false;
+			msleep(50);
+			sw_psy = power_supply_get_by_name("usb_switch");
+			if (!sw_psy)
+				break;
+			sw_dev = power_supply_get_drvdata(sw_psy);
+			if (sw_dev) {
+				struct work_struct *rfc_work =
+					(struct work_struct *)((char *)sw_dev + 0x8);
+				busy = (work_busy(rfc_work) != 0);
+			}
+			power_supply_put(sw_psy);
+			if (!busy)
+				break;
+		}
+	} else if (need_rehandshake) {
+		void *reset_sym = (void *)kallsyms_lookup_name("dcp_reset_rfc");
+		if (reset_sym)
+			chihiro_call_dcp_reset_rfc(reset_sym);
+
+		msleep(200);
+
+		if (chihiro_bypass_active || chihiro_charge_limit_ua != 0 ||
+		    !chihiro_is_charger_online())
+			return;
+
+		sw_psy = power_supply_get_by_name("usb_switch");
+		if (sw_psy) {
+			sw_dev = power_supply_get_drvdata(sw_psy);
+			if (sw_dev && *(u8 *)((char *)sw_dev + 0x17a) == 0) {
+				struct work_struct *rfc_work =
+					(struct work_struct *)((char *)sw_dev + 0x8);
+				*(u8 *)((char *)sw_dev + 0x100) = 0; /* chg_in = 0 */
+				*(u8 *)((char *)sw_dev + 0x178) = 0; /* rfc_dcp_ta = 0 */
+				queue_work(system_wq, rfc_work);
+			}
+			power_supply_put(sw_psy);
+		}
+
+		for (wait_loops = 0; wait_loops < 12; wait_loops++) {
+			bool busy = false;
+			msleep(50);
+			if (chihiro_bypass_active || chihiro_charge_limit_ua != 0 ||
+			    !chihiro_is_charger_online())
+				return;
+			sw_psy = power_supply_get_by_name("usb_switch");
+			if (!sw_psy)
+				break;
+			sw_dev = power_supply_get_drvdata(sw_psy);
+			if (sw_dev) {
+				struct work_struct *rfc_work =
+					(struct work_struct *)((char *)sw_dev + 0x8);
+				busy = (work_busy(rfc_work) != 0);
+			}
+			power_supply_put(sw_psy);
+			if (!busy && wait_loops >= 2)
+				break;
+		}
+	}
+
+	mchg = power_supply_get_by_name("mtk-master-charger");
+	if (mchg) {
+		info = power_supply_get_drvdata(mchg);
+		pe5_info = chihiro_find_pe5_info(info);
+		if (pe5_info) {
+			u32 state = *(u32 *)((char *)pe5_info + 0x2e8);
+			*(u8 *)((char *)pe5_info + 0x14c) = 1; /* inited = 1 (NEVER 0!) */
+			if (state == 5) {
+				*(u8 *)((char *)pe5_info + 0x14d) = 0; /* ta_ready = 0 -> re-auth */
+				*(u8 *)((char *)pe5_info + 0x14e) = 0; /* run_once = 0 */
+				*(u32 *)((char *)pe5_info + 0x148) = 0;
+				*(u32 *)((char *)pe5_info + 0x3ec) = 1; /* rfc_ta_det_done = 1 */
+				*(u32 *)((char *)pe5_info + 0x33c) = 0; /* pe50_ai_discharger = 0 */
+			}
+		}
+		if (info)
+			chihiro_sync_mtk_charger_info(info, true, mchg);
+		power_supply_put(mchg);
+	}
+}
+
+void chihiro_charging_sysfs_write(const char *name, const char *buf)
+{
+	long val = 0;
+	bool matched = false;
+	bool prev_bypass = chihiro_bypass_active;
+	int prev_limit_ua = chihiro_charge_limit_ua;
+	bool request_renegotiate = false;
+
+	if (!name || !buf)
+		return;
+
+	if (!strcmp(name, "bypass_charger") ||
+	    !strcmp(name, "cmd_discharging") ||
+	    !strcmp(name, "tran_aichg_disable_charger") ||
+	    !strcmp(name, "High_voltage_chg_enable") ||
+	    !strcmp(name, "input_current") ||
+	    !strcmp(name, "sc_ibat_limit") ||
+	    !strcmp(name, "adapter_capacity") ||
+	    !strcmp(name, "enable_sc") ||
+	    !strcmp(name, "limit_current") ||
+	    !strcmp(name, "chihiro_charge_limit")) {
+		matched = true;
+	}
+
+	if (!matched)
+		return;
+
+	if (kstrtol(buf, 10, &val) != 0) {
+		if (kstrtol(buf, 16, &val) != 0)
+			return;
+	}
+
+	if (!strcmp(name, "chihiro_charge_limit")) {
+		chihiro_user_mode_locked = true;
+		if (val == 99) {
+			chihiro_bypass_active = true;
+		} else {
+			chihiro_bypass_active = false;
+			if (val == 5 || val == 1000 || val == 5000 || val == 1000000 || (val > 0 && val <= 1200))
+				chihiro_charge_limit_ua = 1000000; /* SLOW 5W */
+			else if (val == 10 || val == 12 || val == 2000 || val == 10000 || val == 2000000 || (val > 1200 && val <= 2500))
+				chihiro_charge_limit_ua = 2000000; /* NORMAL 10W */
+			else if (val <= 0 || val == 44 || val == 68 || val >= 3000) {
+				chihiro_charge_limit_ua = 0;       /* FAST 68W */
+				if (val == 68 || prev_bypass || prev_limit_ua > 0)
+					request_renegotiate = true;
+			}
+		}
+	} else if (!strcmp(name, "bypass_charger") ||
+		   !strcmp(name, "cmd_discharging") ||
+		   !strcmp(name, "tran_aichg_disable_charger")) {
+		chihiro_bypass_active = (val > 0);
+		if (!chihiro_bypass_active && prev_bypass && chihiro_charge_limit_ua == 0)
+			request_renegotiate = true;
+	} else if (!chihiro_user_mode_locked) {
+		/* Ignore SmartCharging/XOS thermal daemon writes unless user hasn't locked mode yet;
+		 * never treat SmartCharging enable_sc or mA sc_ibat_limit/limit_current as mode downgrades.
+		 */
+		if (!strcmp(name, "High_voltage_chg_enable") && val == 1) {
+			chihiro_bypass_active = false;
+			chihiro_charge_limit_ua = 0;
+			if (prev_bypass || prev_limit_ua > 0)
+				request_renegotiate = true;
+		}
+	}
+
+	chihiro_apply_hardware_limits();
+
+	if (request_renegotiate && chihiro_rfc_work_ready &&
+	    !chihiro_bypass_active && chihiro_charge_limit_ua == 0 &&
+	    (!chihiro_has_reset_rfc ||
+	     time_after(jiffies, chihiro_last_rfc_reset_jiffies + msecs_to_jiffies(2500)))) {
+		chihiro_has_reset_rfc = true;
+		chihiro_auto_rfc_retries = 0;
+		chihiro_last_rfc_reset_jiffies = jiffies;
+		schedule_delayed_work(&chihiro_rfc_reset_work, msecs_to_jiffies(100));
+	}
+}
+EXPORT_SYMBOL_GPL(chihiro_charging_sysfs_write);
+
+static ssize_t chihiro_charge_limit_proc_read(struct file *file, char __user *ubuf,
+					      size_t count, loff_t *ppos)
+{
+	char buf[32];
+	int len = scnprintf(buf, sizeof(buf), "%d\n", chihiro_charge_limit_ua);
+	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
+}
+
+static ssize_t chihiro_charge_limit_proc_write(struct file *file, const char __user *ubuf,
+					       size_t count, loff_t *ppos)
+{
+	char kbuf[32];
+	size_t len;
+
+	if (!ubuf || count == 0)
+		return -EINVAL;
+
+	len = min(count, sizeof(kbuf) - 1);
+	if (copy_from_user(kbuf, ubuf, len))
+		return -EFAULT;
+	kbuf[len] = '\0';
+
+	chihiro_charging_sysfs_write("chihiro_charge_limit", kbuf);
+	return count;
+}
+
+static const struct proc_ops chihiro_charge_limit_proc_ops = {
+	.proc_read = chihiro_charge_limit_proc_read,
+	.proc_write = chihiro_charge_limit_proc_write,
+	.proc_lseek = default_llseek,
+};
+
+static void chihiro_init_proc_entry(void)
+{
+	struct proc_dir_entry *entry;
+
+	INIT_DELAYED_WORK(&chihiro_rfc_reset_work, chihiro_rfc_reset_workfn);
+	INIT_DELAYED_WORK(&chihiro_usb_unplug_work, chihiro_usb_unplug_workfn);
+	chihiro_rfc_work_ready = true;
+
+	entry = proc_create("chihiro_charge_limit", 0666, NULL, &chihiro_charge_limit_proc_ops);
+	if (entry)
+		proc_set_user(entry, GLOBAL_ROOT_UID, GLOBAL_ROOT_GID);
+}
+
 int power_supply_get_property(struct power_supply *psy,
 			    enum power_supply_property psp,
 			    union power_supply_propval *val)
 {
+	int ret;
+
 	if (atomic_read(&psy->use_cnt) <= 0) {
 		if (!psy->initialized)
 			return -EAGAIN;
 		return -ENODEV;
 	}
 
-	return psy->desc->get_property(psy, psp, val);
+	ret = psy->desc->get_property(psy, psp, val);
+	if (ret < 0)
+		return ret;
+
+	if (psy->desc && psy->desc->name) {
+		const char *pname = psy->desc->name;
+		if (!strcmp(pname, "mtk-mst-div-chg") ||
+		    !strcmp(pname, "mtk-slv-div-chg") ||
+		    !strcmp(pname, "primary_dvchg") ||
+		    !strcmp(pname, "secondary_dvchg") ||
+		    !strcmp(pname, "divider_charger")) {
+			if (chihiro_charge_limit_ua > 0) {
+				if (psp == POWER_SUPPLY_PROP_ONLINE ||
+				    psp == POWER_SUPPLY_PROP_PRESENT) {
+					val->intval = 0;
+					return 0;
+				} else if (psp == POWER_SUPPLY_PROP_CURRENT_MAX ||
+					   psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT ||
+					   psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT ||
+					   psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX) {
+					val->intval = 0;
+					return 0;
+				}
+			}
+		} else if (!strcmp(pname, "usb_switch")) {
+			if (psp == POWER_SUPPLY_PROP_ONLINE &&
+			    (!chihiro_is_charger_online() || chihiro_is_otg_active())) {
+				void *sw_dev = power_supply_get_drvdata(psy);
+
+				val->intval = 0;
+				if (sw_dev)
+					*(u32 *)((char *)sw_dev + 0x188) = 0;
+				chihiro_maybe_reset_usb_switch();
+			}
+		} else if (!strcmp(pname, "charger") ||
+			   !strcmp(pname, "mtk-master-charger") ||
+			   !strcmp(pname, "primary_chg") ||
+			   !strcmp(pname, "rt9471_chg")) {
+			union power_supply_propval oval;
+			bool is_online = false;
+
+			if (psy->desc->get_property(psy, POWER_SUPPLY_PROP_ONLINE, &oval) == 0 &&
+			    oval.intval > 0)
+				is_online = true;
+
+			if (!strcmp(pname, "mtk-master-charger") &&
+			    (is_online || chihiro_bypass_active)) {
+				void *info = power_supply_get_drvdata(psy);
+				if (info)
+					chihiro_sync_mtk_charger_info(info, false, NULL);
+			}
+
+			if (!is_online || chihiro_is_otg_active()) {
+				if (chihiro_rfc_work_ready)
+					cancel_delayed_work(&chihiro_rfc_reset_work);
+				if (!strcmp(pname, "mtk-master-charger") ||
+				    !strcmp(pname, "charger"))
+					chihiro_maybe_reset_usb_switch();
+			}
+
+			if (!strcmp(pname, "mtk-master-charger")) {
+				if (!is_online || chihiro_is_otg_active()) {
+					chihiro_auto_rfc_retries = 0;
+					chihiro_last_rfc_reset_jiffies = jiffies;
+				} else if (!chihiro_bypass_active && chihiro_charge_limit_ua == 0 &&
+					   chihiro_rfc_work_ready) {
+					void *info = power_supply_get_drvdata(psy);
+					void *pe5_info = chihiro_find_pe5_info(info);
+					if (chihiro_last_rfc_reset_jiffies == 0)
+						chihiro_last_rfc_reset_jiffies = jiffies;
+					if (pe5_info) {
+						u32 state = *(u32 *)((char *)pe5_info + 0x2e8);
+						if (state != 5) {
+							chihiro_auto_rfc_retries = 0;
+							chihiro_last_rfc_reset_jiffies = jiffies;
+						} else if (chihiro_auto_rfc_retries < 3 &&
+							   time_after(jiffies, chihiro_last_rfc_reset_jiffies + msecs_to_jiffies(6000))) {
+							chihiro_has_reset_rfc = true;
+							chihiro_auto_rfc_retries++;
+							chihiro_last_rfc_reset_jiffies = jiffies;
+							schedule_delayed_work(&chihiro_rfc_reset_work, msecs_to_jiffies(200));
+						}
+					}
+				}
+			}
+
+			if (!is_online &&
+			    (psp == POWER_SUPPLY_PROP_TYPE ||
+			     psp == POWER_SUPPLY_PROP_USB_TYPE)) {
+				val->intval = 0;
+			} else if (psp == POWER_SUPPLY_PROP_TYPE) {
+				if (is_online) {
+					if (chihiro_is_sdp_connected(psy))
+						val->intval = POWER_SUPPLY_TYPE_USB;
+					else if (val->intval == POWER_SUPPLY_TYPE_UNKNOWN)
+						val->intval = POWER_SUPPLY_TYPE_USB_DCP;
+				}
+			} else if (psp == POWER_SUPPLY_PROP_CURRENT_MAX ||
+				   psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT ||
+				   psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT ||
+				   psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX) {
+				if (chihiro_charge_limit_ua == 1000000) {
+					val->intval = 1000000;
+				} else if (chihiro_charge_limit_ua == 2000000) {
+					val->intval = 2000000;
+				} else if (is_online && !chihiro_is_sdp_connected(psy)) {
+					if (psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT ||
+					    psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX) {
+						if (val->intval < 6000000)
+							val->intval = 6000000;
+					} else if (val->intval < 3400000) {
+						val->intval = 3400000;
+					}
+				}
+			} else if (psp == POWER_SUPPLY_PROP_INPUT_VOLTAGE_LIMIT ||
+				   psp == POWER_SUPPLY_PROP_VOLTAGE_MAX) {
+				if (chihiro_charge_limit_ua > 0 && val->intval > 5000000) {
+					val->intval = 5000000;
+				}
+			}
+		}
+	}
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(power_supply_get_property);
 
@@ -975,8 +1775,67 @@ int power_supply_set_property(struct power_supply *psy,
 			    enum power_supply_property psp,
 			    const union power_supply_propval *val)
 {
+	union power_supply_propval modified_val;
+
 	if (atomic_read(&psy->use_cnt) <= 0 || !psy->desc->set_property)
 		return -ENODEV;
+
+	if (val) {
+		modified_val = *val;
+		if (psy->desc && psy->desc->name) {
+			const char *pname = psy->desc->name;
+			if (!strcmp(pname, "mtk-mst-div-chg") ||
+			    !strcmp(pname, "mtk-slv-div-chg") ||
+			    !strcmp(pname, "primary_dvchg") ||
+			    !strcmp(pname, "secondary_dvchg") ||
+			    !strcmp(pname, "divider_charger")) {
+				if (chihiro_charge_limit_ua > 0) {
+					if (psp == POWER_SUPPLY_PROP_ONLINE ||
+					    psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT ||
+					    psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT ||
+					    psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX ||
+					    psp == POWER_SUPPLY_PROP_CURRENT_MAX) {
+						modified_val.intval = 0;
+					}
+				}
+			} else if (!strcmp(pname, "charger") ||
+				   !strcmp(pname, "mtk-master-charger") ||
+				   !strcmp(pname, "primary_chg") ||
+				   !strcmp(pname, "rt9471_chg")) {
+				if (psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT ||
+				    psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT ||
+				    psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX ||
+				    psp == POWER_SUPPLY_PROP_CURRENT_MAX) {
+					if (chihiro_charge_limit_ua == 1000000) {
+						if (modified_val.intval > 1000000 || modified_val.intval <= 0)
+							modified_val.intval = 1000000;
+					} else if (chihiro_charge_limit_ua == 2000000) {
+						if (modified_val.intval > 2000000 || modified_val.intval <= 0)
+							modified_val.intval = 2000000;
+					}
+				} else if (psp == POWER_SUPPLY_PROP_INPUT_VOLTAGE_LIMIT ||
+					   psp == POWER_SUPPLY_PROP_VOLTAGE_MAX) {
+					if (chihiro_charge_limit_ua > 0 && modified_val.intval > 5000000) {
+						modified_val.intval = 5000000;
+					}
+				}
+			}
+		}
+		{
+			int ret = psy->desc->set_property(psy, psp, &modified_val);
+			if (psy->desc && psy->desc->name &&
+			    !strcmp(psy->desc->name, "mtk-master-charger")) {
+				if (chihiro_is_charger_online() || chihiro_bypass_active) {
+					void *info = power_supply_get_drvdata(psy);
+					if (info)
+						chihiro_sync_mtk_charger_info(info, false, NULL);
+				} else {
+					chihiro_maybe_reset_usb_switch();
+				}
+			}
+			return ret;
+		}
+	}
 
 	return psy->desc->set_property(psy, psp, val);
 }
@@ -1464,6 +2323,8 @@ static int __init power_supply_class_init(void)
 
 	power_supply_class->dev_uevent = power_supply_uevent;
 	power_supply_init_attrs(&power_supply_dev_type);
+
+	chihiro_init_proc_entry();
 
 	return 0;
 }

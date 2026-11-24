@@ -1503,6 +1503,39 @@ task_may_not_preempt(struct task_struct *task, int cpu)
 EXPORT_SYMBOL_GPL(task_may_not_preempt);
 #endif /* CONFIG_RT_SOFTINT_OPTIMIZATION */
 
+extern bool chihiro_is_gaming_active(void);
+
+static inline int chihiro_rt_deflect_big(struct task_struct *p, int cpu)
+{
+	int c, best = -1;
+	int best_prio = -1;
+
+	if (!chihiro_is_gaming_active() || cpu < 6 || nr_cpu_ids < 8 ||
+	    p->nr_cpus_allowed <= 1 || cpu_rq(cpu)->nr_running == 0)
+		return cpu;
+
+	/* Keep RT audio/compositor tasks on Little cores (1..5, fallback 0) */
+	for (c = 1; c < 6; c++) {
+		int prio;
+
+		if (!cpu_online(c) || !cpu_active(c) ||
+		    !cpumask_test_cpu(c, p->cpus_ptr))
+			continue;
+		prio = cpu_rq(c)->rt.highest_prio.curr;
+		if (prio > best_prio) {
+			best_prio = prio;
+			best = c;
+		}
+	}
+	if (best >= 0)
+		return best;
+
+	if (cpu_online(0) && cpu_active(0) && cpumask_test_cpu(0, p->cpus_ptr))
+		return 0;
+
+	return cpu;
+}
+
 static int
 select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
 {
@@ -1518,7 +1551,7 @@ select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
 	trace_android_rvh_select_task_rq_rt(p, cpu, sd_flag,
 					flags, &target_cpu);
 	if (target_cpu >= 0)
-		return target_cpu;
+		return chihiro_rt_deflect_big(p, target_cpu);
 
 	/* For anything but wake ups, just return the task_cpu */
 	if (sd_flag != SD_BALANCE_WAKE && sd_flag != SD_BALANCE_FORK)
@@ -1614,7 +1647,7 @@ out_unlock:
 	rcu_read_unlock();
 
 out:
-	return cpu;
+	return chihiro_rt_deflect_big(p, cpu);
 }
 
 static void check_preempt_equal_prio(struct rq *rq, struct task_struct *p)
@@ -1841,9 +1874,16 @@ static int find_lowest_rq(struct task_struct *task)
 				  task, lowest_mask);
 	}
 
+	if (ret && chihiro_is_gaming_active() && nr_cpu_ids >= 8) {
+		if (cpumask_first(lowest_mask) < 6) {
+			cpumask_clear_cpu(6, lowest_mask);
+			cpumask_clear_cpu(7, lowest_mask);
+		}
+	}
+
 	trace_android_rvh_find_lowest_rq(task, lowest_mask, ret, &cpu);
 	if (cpu >= 0)
-		return cpu;
+		return chihiro_rt_deflect_big(task, cpu);
 
 	if (!ret)
 		return -1; /* No targets found */

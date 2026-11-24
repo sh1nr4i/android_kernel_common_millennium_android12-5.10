@@ -61,9 +61,9 @@ enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_N
  *
  * (default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-unsigned int sysctl_sched_min_granularity			= 400000ULL;
+unsigned int sysctl_sched_min_granularity			= 500000ULL;
 EXPORT_SYMBOL_GPL(sysctl_sched_min_granularity);
-static unsigned int normalized_sysctl_sched_min_granularity	= 400000ULL;
+static unsigned int normalized_sysctl_sched_min_granularity	= 500000ULL;
 
 /*
  * This value is kept at sysctl_sched_latency/sysctl_sched_min_granularity
@@ -85,8 +85,8 @@ unsigned int sysctl_sched_child_runs_first __read_mostly;
  *
  * (default: 1 msec * (1 + ilog(ncpus)), units: nanoseconds)
  */
-unsigned int sysctl_sched_wakeup_granularity			= 500000UL;
-static unsigned int normalized_sysctl_sched_wakeup_granularity	= 500000UL;
+unsigned int sysctl_sched_wakeup_granularity			= 750000UL;
+static unsigned int normalized_sysctl_sched_wakeup_granularity	= 750000UL;
 
 const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
 
@@ -114,11 +114,11 @@ int __weak arch_asym_cpu_priority(int cpu)
 
 /*
  * The margin used when comparing utilization with CPU capacity.
- * Tuned to ~8% margin (capacity threshold ~92%) so that 6x Cortex-A55 Little cores
- * (capacity 348) can comfortably process top-app uclamp.min (30% = util 307)
- * without prematurely dumping all interactive tasks onto the 2x Big cores.
+ * Tuned to ~11% margin (capacity threshold ~89%: 309 util on A55 cap 348) so
+ * light UI touch boost (30% = 307) still stays cool on Little cores while
+ * active 90/120Hz UI & game threads (>=310) promote immediately to Big A76.
  */
-#define fits_capacity(cap, max)	((cap) * 1110 < (max) * 1024)
+#define fits_capacity(cap, max)	((cap) * 1152 < (max) * 1024)
 
 /*
  * The margin used when comparing CPU capacities.
@@ -5781,12 +5781,22 @@ static inline void hrtick_update(struct rq *rq)
 
 #ifdef CONFIG_SMP
 static inline unsigned long cpu_util(int cpu);
+bool chihiro_is_gaming_active(void);
 
 static inline bool cpu_overutilized(int cpu)
 {
 	unsigned long rq_util_min = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN);
 	unsigned long rq_util_max = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX);
 	int overutilized = -1;
+
+	/*
+	 * Dedicated gaming Big cores (CPU 6 & 7) running a single primary
+	 * render thread (UnityMain/UnityGfxDeviceW at 85-100%) are NOT
+	 * "overloaded" — do not trigger overutilized migration to A55 Little.
+	 */
+	if (cpu >= 6 && chihiro_is_gaming_active() &&
+	    cpu_rq(cpu)->nr_running <= 1)
+		return false;
 
 	trace_android_rvh_cpu_overutilized(cpu, &overutilized);
 	if (overutilized != -1)
@@ -7144,6 +7154,213 @@ unlock:
  *
  * preempt must be disabled.
  */
+static unsigned long chihiro_last_heavy_game_jiffies;
+static unsigned long chihiro_last_render_b_jiffies;
+static pid_t chihiro_game_tgid;
+
+bool chihiro_is_gaming_active(void)
+{
+	unsigned long last = READ_ONCE(chihiro_last_heavy_game_jiffies);
+
+	return last != 0 && time_before(jiffies, last + msecs_to_jiffies(2500));
+}
+
+pid_t chihiro_get_game_tgid(void)
+{
+	if (!chihiro_is_gaming_active())
+		return 0;
+	return READ_ONCE(chihiro_game_tgid);
+}
+
+/*
+ * Role A -> CPU 7 (main game simulation/logic thread)
+ * Role B -> CPU 6 (GPU submission / render thread)
+ * Returns 7 for Role A, 6 for Role B, or 0 for non-primary tasks.
+ * Note: Never match standalone Android HWUI "RenderThread" (used by SystemUI,
+ * Launcher3, Settings, etc.) — only match "RenderThread" if it belongs to an
+ * already-active game TGID (e.g. Unreal Engine alongside GameThread).
+ */
+int chihiro_primary_big_cpu(struct task_struct *p)
+{
+	if (!strncmp(p->comm, "UnityMain", 9) ||
+	    !strncmp(p->comm, "GameThread", 10))
+		return 7;
+
+	if (!strncmp(p->comm, "UnityGfxDevice", 14) ||
+	    !strncmp(p->comm, "RHIThread", 9))
+		return 6;
+
+	if (!strncmp(p->comm, "RenderThread", 12) &&
+	    chihiro_is_gaming_active() &&
+	    p->tgid == READ_ONCE(chihiro_game_tgid))
+		return 6;
+
+	return 0;
+}
+
+static inline bool chihiro_is_primary_render_thread(struct task_struct *p)
+{
+	return chihiro_primary_big_cpu(p) != 0;
+}
+
+static inline bool chihiro_is_heavy_game_thread(struct task_struct *p)
+{
+	if (chihiro_is_primary_render_thread(p))
+		return true;
+	return task_util_est(p) >= 180;
+}
+
+static inline int chihiro_pick_little_cpu(struct task_struct *p, int fallback)
+{
+	int best = -1;
+	unsigned int best_nr = UINT_MAX;
+	unsigned long best_util = ULONG_MAX;
+	int c;
+
+	/* Prefer Little cores 1..5 first to avoid IRQ-heavy CPU 0 */
+	for (c = 1; c < 6; c++) {
+		unsigned int nr;
+		unsigned long u;
+
+		if (!cpu_online(c) || !cpu_active(c) ||
+		    !cpumask_test_cpu(c, p->cpus_ptr))
+			continue;
+
+		nr = cpu_rq(c)->nr_running;
+		u = cpu_util_cfs(cpu_rq(c));
+		if (nr < best_nr || (nr == best_nr && u < best_util)) {
+			best = c;
+			best_nr = nr;
+			best_util = u;
+		}
+	}
+
+	if (best >= 0)
+		return best;
+
+	if (cpu_online(0) && cpu_active(0) && cpumask_test_cpu(0, p->cpus_ptr))
+		return 0;
+
+	return fallback;
+}
+
+static inline int chihiro_spread_big_cpu(struct task_struct *p, int target_cpu)
+{
+	int primary_cpu;
+
+	if (nr_cpu_ids < 8)
+		return target_cpu;
+
+	primary_cpu = chihiro_primary_big_cpu(p);
+	if (primary_cpu) {
+		int alt_cpu = primary_cpu ^ 1;
+
+		/* Only engage full gaming boost when the game thread is actively rendering */
+		if (task_util_est(p) >= 100) {
+			WRITE_ONCE(chihiro_last_heavy_game_jiffies, jiffies);
+			WRITE_ONCE(chihiro_game_tgid, p->tgid);
+			if (primary_cpu == 6)
+				WRITE_ONCE(chihiro_last_render_b_jiffies, jiffies);
+		}
+
+		/*
+		 * Deterministic Big-core split:
+		 * - UnityMain / GameThread -> dedicated CPU 7
+		 * - UnityGfxDeviceW / RenderThread / RHIThread -> dedicated CPU 6
+		 */
+		if (cpu_online(primary_cpu) && cpu_active(primary_cpu) &&
+		    cpumask_test_cpu(primary_cpu, p->cpus_ptr))
+			return primary_cpu;
+		if (cpu_online(alt_cpu) && cpu_active(alt_cpu) &&
+		    cpumask_test_cpu(alt_cpu, p->cpus_ptr))
+			return alt_cpu;
+		return target_cpu;
+	}
+
+	/*
+	 * Exclusive Big-Core Shield while gaming:
+	 * Deflect non-primary CFS tasks away from CPU 6 & CPU 7 onto all 6
+	 * Little Cortex-A55 cores (0..5) so UnityMain & UnityGfxDeviceW stay
+	 * isolated while SystemUI, SurfaceFlinger & workers have full 6-core room.
+	 */
+	if (chihiro_is_gaming_active()) {
+		pid_t game_tgid = READ_ONCE(chihiro_game_tgid);
+
+		if (target_cpu >= 6) {
+			unsigned long last_b =
+				READ_ONCE(chihiro_last_render_b_jiffies);
+			bool has_render_b = last_b != 0 &&
+				time_before(jiffies, last_b + msecs_to_jiffies(1500));
+
+			/*
+			 * When Big core is idle & lightly utilized (<35%), allow
+			 * active game workers (Job.worker/mali-cmar) to use it
+			 * for snappy 120fps framing without disturbing busy HSR.
+			 */
+			if (game_tgid && p->tgid == game_tgid &&
+			    task_util_est(p) >= 200 &&
+			    cpu_rq(target_cpu)->nr_running == 0 &&
+			    cpu_util_cfs(cpu_rq(target_cpu)) < 350)
+				return target_cpu;
+
+			/* Single-threaded games without RenderB may use idle CPU 6 */
+			if (!has_render_b && target_cpu == 6 &&
+			    task_util_est(p) >= 300 &&
+			    cpu_rq(6)->nr_running == 0)
+				return 6;
+
+			return chihiro_pick_little_cpu(p, target_cpu);
+		}
+		/* Gently steer active game workers off IRQ-heavy CPU 0 (20%+ IRQ) onto CPU 1..5 */
+		if (target_cpu == 0) {
+			if (game_tgid && p->tgid == game_tgid)
+				return chihiro_pick_little_cpu(p, 0);
+		}
+		return target_cpu;
+	}
+
+	if (task_util_est(p) >= 380) {
+		int best = -1;
+		unsigned int best_nr = UINT_MAX;
+		unsigned long best_util = ULONG_MAX;
+		int big;
+
+		for (big = 6; big < 8; big++) {
+			unsigned int nr;
+			unsigned long u;
+
+			if (!cpu_online(big) || !cpu_active(big) ||
+			    !cpumask_test_cpu(big, p->cpus_ptr))
+				continue;
+
+			nr = cpu_rq(big)->nr_running;
+			u = cpu_util_cfs(cpu_rq(big));
+
+			if (nr < best_nr ||
+			    (nr == best_nr && u < best_util) ||
+			    (nr == best_nr && u == best_util && big == target_cpu)) {
+				best = big;
+				best_nr = nr;
+				best_util = u;
+			}
+		}
+
+		if (best >= 0 && (best_nr == 0 || target_cpu >= 6 ||
+				  (best_nr == 1 && best_util < 550)))
+			return best;
+	} else if (target_cpu >= 6 && target_cpu < 8 &&
+		   cpu_rq(target_cpu)->nr_running > 0) {
+		int sib = target_cpu ^ 1;
+
+		if (cpu_online(sib) && cpu_active(sib) &&
+		    cpumask_test_cpu(sib, p->cpus_ptr) &&
+		    cpu_rq(sib)->nr_running == 0)
+			return sib;
+	}
+
+	return target_cpu;
+}
+
 static int
 select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
 {
@@ -7160,7 +7377,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 	trace_android_rvh_select_task_rq_fair(p, prev_cpu, sd_flag,
 			wake_flags, &target_cpu);
 	if (target_cpu >= 0)
-		return target_cpu;
+		return chihiro_spread_big_cpu(p, target_cpu);
 
 	if (sd_flag & SD_BALANCE_WAKE) {
 		record_wakee(p);
@@ -7168,7 +7385,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 		if (sched_energy_enabled()) {
 			new_cpu = find_energy_efficient_cpu(p, prev_cpu, sync);
 			if (new_cpu >= 0)
-				return new_cpu;
+				return chihiro_spread_big_cpu(p, new_cpu);
 			new_cpu = prev_cpu;
 		}
 
@@ -7209,7 +7426,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 	}
 	rcu_read_unlock();
 
-	return new_cpu;
+	return chihiro_spread_big_cpu(p, new_cpu);
 }
 
 static void detach_entity_cfs_rq(struct sched_entity *se);
@@ -7419,6 +7636,10 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	 * is driven by the tick):
 	 */
 	if (unlikely(p->policy != SCHED_NORMAL) || !sched_feat(WAKEUP_PREEMPTION))
+		return;
+
+	/* Never let background/secondary CFS tasks preempt primary render threads */
+	if (chihiro_primary_big_cpu(curr) && !chihiro_primary_big_cpu(p))
 		return;
 
 	find_matching_se(&se, &pse);
@@ -7997,6 +8218,31 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
 	trace_android_rvh_can_migrate_task(p, env->dst_cpu, &can_migrate);
 	if (!can_migrate)
 		return 0;
+
+	/*
+	 * Exclusive Big-Core Isolation for Primary Render Threads:
+	 * - Never let load_balance/active_lb migrate UnityMain/GameThread off
+	 *   CPU 7 or UnityGfxDeviceW/RenderThread/RHIThread off CPU 6.
+	 * - While gaming is active, never pull background/secondary tasks onto
+	 *   CPU 6 or CPU 7 so primary render threads suffer zero preemptions.
+	 */
+	{
+		int primary_cpu = chihiro_primary_big_cpu(p);
+
+		if (primary_cpu) {
+			if (env->src_cpu == primary_cpu &&
+			    env->dst_cpu != primary_cpu)
+				return 0;
+			if (env->src_cpu >= 6 && env->dst_cpu < 6)
+				return 0;
+		} else if (chihiro_is_gaming_active() && env->dst_cpu >= 6) {
+			return 0;
+		} else if (env->src_cpu >= 6 && env->dst_cpu < 6 &&
+			   env->src_rq->nr_running <= 1 &&
+			   chihiro_is_heavy_game_thread(p)) {
+			return 0;
+		}
+	}
 
 	/*
 	 * We do not migrate tasks that are:
@@ -9932,6 +10178,9 @@ imbalanced_active_balance(struct lb_env *env)
 
 static int need_active_balance(struct lb_env *env)
 {
+	if (env->src_cpu >= 6 && env->dst_cpu < 6 && chihiro_is_gaming_active())
+		return 0;
+
 	if (asym_active_balance(env))
 		return 1;
 
@@ -10433,9 +10682,11 @@ static void rebalance_domains(struct rq *rq, enum cpu_idle_type idle)
 	int need_serialize, need_decay = 0;
 	u64 max_cost = 0;
 
-	trace_android_rvh_sched_rebalance_domains(rq, &continue_balancing);
-	if (!continue_balancing)
-		return;
+	if (!chihiro_is_gaming_active()) {
+		trace_android_rvh_sched_rebalance_domains(rq, &continue_balancing);
+		if (!continue_balancing)
+			return;
+	}
 
 	rcu_read_lock();
 	for_each_domain(cpu, sd) {
@@ -10610,9 +10861,11 @@ static void nohz_balancer_kick(struct rq *rq)
 	if (time_before(now, nohz.next_balance))
 		goto out;
 
-	trace_android_rvh_sched_nohz_balancer_kick(rq, &flags, &done);
-	if (done)
-		goto out;
+	if (!chihiro_is_gaming_active()) {
+		trace_android_rvh_sched_nohz_balancer_kick(rq, &flags, &done);
+		if (done)
+			goto out;
+	}
 
 	if (rq->nr_running >= 2) {
 		flags = NOHZ_STATS_KICK | NOHZ_BALANCE_KICK;
@@ -11014,9 +11267,21 @@ static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 	int pulled_task = 0;
 	int done = 0;
 
-	trace_android_rvh_sched_newidle_balance(this_rq, rf, &pulled_task, &done);
-	if (done)
-		return pulled_task;
+	/*
+	 * While gaming is active:
+	 * - Big cores (CPU 6 & 7) never pull background tasks during brief GPU waits.
+	 * - Little cores (CPU 0-5) bypass MediaTek scheduler.ko's newidle_balance
+	 *   vendor hook so standard CFS newidle_balance runs and strictly honors
+	 *   our can_migrate_task() Big-core isolation for UnityMain & UnityGfxDeviceW.
+	 */
+	if (chihiro_is_gaming_active()) {
+		if (this_cpu >= 6)
+			return 0;
+	} else {
+		trace_android_rvh_sched_newidle_balance(this_rq, rf, &pulled_task, &done);
+		if (done)
+			return pulled_task;
+	}
 
 	update_misfit_status(NULL, this_rq);
 
@@ -11204,6 +11469,18 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 {
 	struct cfs_rq *cfs_rq;
 	struct sched_entity *se = &curr->se;
+	int primary_cpu = chihiro_primary_big_cpu(curr);
+
+	/*
+	 * Refresh gaming heartbeat on every tick while primary render threads
+	 * execute continuously (100% CPU-bound movement without sleeping).
+	 */
+	if (primary_cpu && task_util_est(curr) >= 100) {
+		WRITE_ONCE(chihiro_last_heavy_game_jiffies, jiffies);
+		WRITE_ONCE(chihiro_game_tgid, curr->tgid);
+		if (primary_cpu == 6)
+			WRITE_ONCE(chihiro_last_render_b_jiffies, jiffies);
+	}
 
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);

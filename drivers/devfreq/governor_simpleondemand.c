@@ -12,9 +12,9 @@
 #include <linux/math64.h>
 #include "governor.h"
 
-/* Default constants for DevFreq-Simple-Ondemand (DFSO) */
-#define DFSO_UPTHRESHOLD	(90)
-#define DFSO_DOWNDIFFERENCTIAL	(5)
+/* Tuned for responsive Mali-G57 GPU scaling across both 90/120Hz UI & gaming */
+#define DFSO_UPTHRESHOLD	(65)
+#define DFSO_DOWNDIFFERENCTIAL	(15)
 static int devfreq_simple_ondemand_func(struct devfreq *df,
 					unsigned long *freq)
 {
@@ -33,12 +33,12 @@ static int devfreq_simple_ondemand_func(struct devfreq *df,
 
 	if (data) {
 		if (data->upthreshold)
-			dfso_upthreshold = data->upthreshold;
+			dfso_upthreshold = min_t(unsigned int, data->upthreshold, 65U);
 		if (data->downdifferential)
-			dfso_downdifferential = data->downdifferential;
+			dfso_downdifferential = max_t(unsigned int, data->downdifferential, 15U);
 	}
 	if (dfso_upthreshold > 100 ||
-	    dfso_upthreshold < dfso_downdifferential)
+	    dfso_upthreshold <= dfso_downdifferential)
 		return -EINVAL;
 
 	/* Assume MAX if it is going to be divided by zero */
@@ -79,6 +79,9 @@ static int devfreq_simple_ondemand_func(struct devfreq *df,
 	b = div_u64(a, stat->total_time);
 	b *= 100;
 	b = div_u64(b, (dfso_upthreshold - dfso_downdifferential / 2));
+	/* Add 20% headroom under active 3D/compositor load (>=35% busy) */
+	if (stat->busy_time * 100 >= stat->total_time * 35)
+		b = div_u64(b * 120, 100);
 	*freq = (unsigned long) b;
 
 	return 0;

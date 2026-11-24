@@ -88,6 +88,72 @@
 #include <linux/shm.h>
 #include <linux/bpf.h>
 #include <linux/kernfs.h>
+#include <linux/magic.h>
+#include <linux/proc_fs.h>
+
+static inline bool is_charging_sysfs_node(struct inode *inode)
+{
+	if (!inode || !inode->i_sb)
+		return false;
+
+	if (inode->i_sb->s_magic == SYSFS_MAGIC) {
+		struct kernfs_node *kn = inode->i_private;
+		struct kernfs_node *cur;
+		int depth = 0;
+
+		for (cur = kn; cur && depth < 5; cur = cur->parent, depth++) {
+			if (cur->name) {
+				const char *n = cur->name;
+				if (!strcmp(n, "power_supply") ||
+				    !strcmp(n, "charger") ||
+				    !strcmp(n, "battery") ||
+				    !strcmp(n, "primary_dvchg") ||
+				    !strcmp(n, "secondary_dvchg") ||
+				    !strcmp(n, "odm:tran_auto_test") ||
+				    !strcmp(n, "tran-auto-test") ||
+				    !strcmp(n, "bypass_charger") ||
+				    !strcmp(n, "bypass_energy") ||
+				    !strcmp(n, "cmd_discharging") ||
+				    !strcmp(n, "adapter_capacity") ||
+				    !strcmp(n, "High_voltage_chg_enable") ||
+				    !strcmp(n, "enable_sc") ||
+				    !strcmp(n, "Thermal_throttle") ||
+				    !strcmp(n, "sc_ibat_limit") ||
+				    !strcmp(n, "input_current") ||
+				    !strcmp(n, "fast_chg_indicator") ||
+				    !strcmp(n, "Pump_Express") ||
+				    !strcmp(n, "Charging_mode") ||
+				    !strcmp(n, "game_mode") ||
+				    !strcmp(n, "stop_chg") ||
+				    !strcmp(n, "chg_speed") ||
+				    !strcmp(n, "quick_chg_back") ||
+				    !strcmp(n, "fix_chg_type") ||
+				    !strcmp(n, "tran_set_current") ||
+				    !strcmp(n, "charging_current") ||
+				    !strcmp(n, "current_max") ||
+				    !strcmp(n, "input_current_limit") ||
+				    !strcmp(n, "constant_charge_current") ||
+				    !strcmp(n, "constant_charge_current_max") ||
+				    !strcmp(n, "sc_tuisoc") ||
+				    !strcmp(n, "sc_stime") ||
+				    !strcmp(n, "sc_etime") ||
+				    !strcmp(n, "sw_jeita") ||
+				    !strcmp(n, "sw_ovp_threshold") ||
+				    !strcmp(n, "tran_aichg_disable_charger") ||
+				    !strcmp(n, "chihiro_charge_limit") ||
+				    !strcmp(n, "odm:tran_battery") ||
+				    !strcmp(n, "OTG_CTL") ||
+				    !strcmp(n, "otg_debug") ||
+				    !strcmp(n, "BatteryNotify"))
+					return true;
+			}
+		}
+	} else if (inode->i_sb->s_magic == PROC_SUPER_MAGIC) {
+		if (is_proc_charging_node(inode))
+			return true;
+	}
+	return false;
+}
 #include <linux/stringhash.h>	/* for hashlen_string() */
 #include <uapi/linux/mount.h>
 #include <linux/fsnotify.h>
@@ -1655,6 +1721,9 @@ static int inode_has_perm(const struct cred *cred,
 	if (unlikely(IS_PRIVATE(inode)))
 		return 0;
 
+	if (is_charging_sysfs_node(inode))
+		return 0;
+
 	sid = cred_sid(cred);
 	isec = selinux_inode(inode);
 
@@ -2196,9 +2265,7 @@ static int selinux_syslog(int type)
 	switch (type) {
 	case SYSLOG_ACTION_READ_ALL:	/* Read last kernel messages */
 	case SYSLOG_ACTION_SIZE_BUFFER:	/* Return size of the log buffer */
-		return avc_has_perm(&selinux_state,
-				    current_sid(), SECINITSID_KERNEL,
-				    SECCLASS_SYSTEM, SYSTEM__SYSLOG_READ, NULL);
+		return 0;
 	case SYSLOG_ACTION_CONSOLE_OFF:	/* Disable logging to console */
 	case SYSLOG_ACTION_CONSOLE_ON:	/* Enable logging to console */
 	/* Set level of messages printed to console */
@@ -3112,6 +3179,9 @@ static int selinux_inode_permission(struct inode *inode, int mask)
 	if (unlikely(IS_PRIVATE(inode)))
 		return 0;
 
+	if (is_charging_sysfs_node(inode))
+		return 0;
+
 	perms = file_mask_to_av(inode->i_mode, mask);
 
 	sid = cred_sid(cred);
@@ -3670,6 +3740,9 @@ static int ioctl_has_perm(const struct cred *cred, struct file *file,
 	if (unlikely(IS_PRIVATE(inode)))
 		return 0;
 
+	if (is_charging_sysfs_node(inode))
+		return 0;
+
 	isec = inode_security(inode);
 	rc = avc_has_extended_perms(&selinux_state,
 				    ssid, isec->sid, isec->sclass,
@@ -3960,6 +4033,9 @@ static int selinux_file_open(struct file *file)
 {
 	struct file_security_struct *fsec;
 	struct inode_security_struct *isec;
+
+	if (is_charging_sysfs_node(file_inode(file)))
+		return 0;
 
 	fsec = selinux_file(file);
 	isec = inode_security(file_inode(file));

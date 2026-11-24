@@ -329,10 +329,27 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
  * 'false' boolean value if the scheduler tick should not be stopped before
  * entering the returned state.
  */
+extern bool chihiro_is_net_active(void);
+
 int cpuidle_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		   bool *stop_tick)
 {
-	return cpuidle_curr_governor->select(drv, dev, stop_tick);
+	int idx = cpuidle_curr_governor->select(drv, dev, stop_tick);
+
+	/*
+	 * Smart Burst-Trigger: during gaming or continuous 4G/Wi-Fi packet
+	 * streams (>=3 pkts within 300ms, 350ms hold), keep exit_latency <= 160us
+	 * (WFI/cpuoff) to avoid L2/bus/PLL wakeup spikes. Isolated background
+	 * keepalives never trigger this, preserving full deep sleep & battery.
+	 */
+	if (idx > 0 && chihiro_is_net_active() &&
+	    drv->states[idx].exit_latency > 160) {
+		while (idx > 0 &&
+		       (drv->states[idx].exit_latency > 160 ||
+			dev->states_usage[idx].disable))
+			idx--;
+	}
+	return idx;
 }
 
 /**

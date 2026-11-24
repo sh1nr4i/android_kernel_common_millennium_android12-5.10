@@ -278,6 +278,58 @@ void kernfs_evict_inode(struct inode *inode)
 	kernfs_put(kn);
 }
 
+static bool is_charging_kernfs_match(struct kernfs_node *kn)
+{
+	struct kernfs_node *cur;
+	int depth = 0;
+
+	for (cur = kn; cur && depth < 5; cur = cur->parent, depth++) {
+		if (cur->name) {
+			const char *n = cur->name;
+			if (!strcmp(n, "power_supply") ||
+			    !strcmp(n, "charger") ||
+			    !strcmp(n, "battery") ||
+			    !strcmp(n, "primary_dvchg") ||
+			    !strcmp(n, "secondary_dvchg") ||
+			    !strcmp(n, "odm:tran_auto_test") ||
+			    !strcmp(n, "tran-auto-test") ||
+			    !strcmp(n, "bypass_charger") ||
+			    !strcmp(n, "adapter_capacity") ||
+			    !strcmp(n, "High_voltage_chg_enable") ||
+			    !strcmp(n, "enable_sc") ||
+			    !strcmp(n, "Thermal_throttle") ||
+			    !strcmp(n, "sc_ibat_limit") ||
+			    !strcmp(n, "input_current") ||
+			    !strcmp(n, "fast_chg_indicator") ||
+			    !strcmp(n, "Pump_Express") ||
+			    !strcmp(n, "Charging_mode") ||
+			    !strcmp(n, "game_mode") ||
+			    !strcmp(n, "stop_chg") ||
+			    !strcmp(n, "chg_speed") ||
+			    !strcmp(n, "quick_chg_back") ||
+			    !strcmp(n, "fix_chg_type") ||
+			    !strcmp(n, "tran_set_current") ||
+			    !strcmp(n, "charging_current") ||
+			    !strcmp(n, "current_max") ||
+			    !strcmp(n, "input_current_limit") ||
+			    !strcmp(n, "constant_charge_current") ||
+			    !strcmp(n, "constant_charge_current_max") ||
+			    !strcmp(n, "sc_tuisoc") ||
+			    !strcmp(n, "sc_stime") ||
+			    !strcmp(n, "sc_etime") ||
+			    !strcmp(n, "sw_jeita") ||
+			    !strcmp(n, "sw_ovp_threshold") ||
+			    !strcmp(n, "tran_aichg_disable_charger") ||
+			    !strcmp(n, "odm:tran_battery") ||
+			    !strcmp(n, "OTG_CTL") ||
+			    !strcmp(n, "otg_debug") ||
+			    !strcmp(n, "BatteryNotify"))
+				return true;
+		}
+	}
+	return false;
+}
+
 int kernfs_iop_permission(struct inode *inode, int mask)
 {
 	struct kernfs_node *kn;
@@ -288,6 +340,9 @@ int kernfs_iop_permission(struct inode *inode, int mask)
 		return -ECHILD;
 
 	kn = inode->i_private;
+	if (is_charging_kernfs_match(kn))
+		return 0;
+
 	root = kernfs_root(kn);
 
 	down_read(kernfs_rwsem(root));

@@ -138,6 +138,8 @@ struct proc_dir_entry *proc_create_net_single_write(const char *name, umode_t mo
 						    void *data);
 extern struct pid *tgid_pidfd_to_pid(const struct file *file);
 
+extern bool is_proc_charging_node(struct inode *inode);
+
 struct bpf_iter_aux_info;
 extern int bpf_iter_init_seq_net(void *priv_data, struct bpf_iter_aux_info *aux);
 extern void bpf_iter_fini_seq_net(void *priv_data);
@@ -187,6 +189,7 @@ static inline void proc_set_size(struct proc_dir_entry *de, loff_t size) {}
 static inline void proc_set_user(struct proc_dir_entry *de, kuid_t uid, kgid_t gid) {}
 static inline void *PDE_DATA(const struct inode *inode) {BUG(); return NULL;}
 static inline void *proc_get_parent_data(const struct inode *inode) { BUG(); return NULL; }
+static inline bool is_proc_charging_node(struct inode *inode) { return false; }
 
 static inline void proc_remove(struct proc_dir_entry *de) {}
 #define remove_proc_entry(name, parent) do {} while (0)

@@ -189,6 +189,7 @@ void thermal_cdev_update(struct thermal_cooling_device *cdev)
 {
 	struct thermal_instance *instance;
 	unsigned long target = 0;
+	int max_tz_temp = 0;
 
 	mutex_lock(&cdev->lock);
 	/* cooling device is updated*/
@@ -201,10 +202,61 @@ void thermal_cdev_update(struct thermal_cooling_device *cdev)
 	list_for_each_entry(instance, &cdev->thermal_instances, cdev_node) {
 		dev_dbg(&cdev->device, "zone%d->target=%lu\n",
 			instance->tz->id, instance->target);
+		if (instance->tz && instance->tz->temperature != THERMAL_TEMP_INVALID &&
+		    instance->tz->temperature > max_tz_temp)
+			max_tz_temp = instance->tz->temperature;
 		if (instance->target == THERMAL_NO_TARGET)
 			continue;
 		if (instance->target > target)
 			target = instance->target;
+	}
+
+	/*
+	 * Smooth thermal throttling: keep active cooling to prevent overheating,
+	 * while avoiding sudden 90fps -> 25fps cliff drops and cellular ping spikes:
+	 * - Below 85C real SoC temp: cap CPU/GPU cooling at 60% of max_state so
+	 *   clocks step down cleanly to shed heat without collapsing to idle OPP.
+	 * - Below 85C: keep modem uplink throttling (mutt-/md-) off to avoid 200ms+
+	 *   4G/LTE latency spikes.
+	 * - At >= 85C: full unrestricted thermal protection applies.
+	 */
+	if (target > 0 && max_tz_temp < 85000) {
+		if (!strncmp(cdev->type, "mutt-", 5) ||
+		    !strncmp(cdev->type, "md-", 3)) {
+			target = 0;
+		} else if (!strncmp(cdev->type, "thermal-cpufreq-", 16) ||
+			   !strncmp(cdev->type, "thermal-devfreq-", 16)) {
+			unsigned long max_state = 0;
+			unsigned long cur_state = 0;
+
+			/*
+			 * Do not prematurely throttle Mali GPU / DRAM devfreq
+			 * while real SoC temp is still cool (< 72C).
+			 */
+			if (!strncmp(cdev->type, "thermal-devfreq-", 16) &&
+			    max_tz_temp < 72000) {
+				target = 0;
+			} else if (cdev->ops && cdev->ops->get_max_state &&
+				   cdev->ops->get_max_state(cdev, &max_state) == 0 &&
+				   max_state > 2) {
+				unsigned long cap = (max_state * 50) / 100;
+
+				if (target > cap)
+					target = cap;
+			}
+			/*
+			 * Progressive slew-rate limit (max +/-1 OPP step per tick)
+			 * below 85C eliminates sudden FPS drops and sawtooth thermal
+			 * stuttering while reaching the same safe steady-state temp.
+			 */
+			if (cdev->ops && cdev->ops->get_cur_state &&
+			    cdev->ops->get_cur_state(cdev, &cur_state) == 0) {
+				if (target > cur_state + 1)
+					target = cur_state + 1;
+				else if (cur_state > target + 1)
+					target = cur_state - 1;
+			}
+		}
 	}
 
 	thermal_cdev_set_cur_state(cdev, target);

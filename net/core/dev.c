@@ -4125,6 +4125,56 @@ struct netdev_queue *netdev_core_pick_tx(struct net_device *dev,
  *      the BH enable code must have IRQs enabled so that it will not deadlock.
  *          --BLG
  */
+extern bool chihiro_is_gaming_active(void);
+
+static unsigned long chihiro_prev_pkt_jiffies;
+static unsigned long chihiro_net_burst_until;
+static unsigned int chihiro_net_streak;
+
+bool chihiro_is_net_active(void)
+{
+	unsigned long until;
+
+	if (chihiro_is_gaming_active())
+		return true;
+
+	until = READ_ONCE(chihiro_net_burst_until);
+	return until != 0 && time_before(jiffies, until);
+}
+
+static inline void chihiro_mark_net_active(struct net_device *dev)
+{
+	unsigned long now, prev;
+
+	if (!dev || (strncmp(dev->name, "ccmni", 5) &&
+		     strncmp(dev->name, "wlan", 4)))
+		return;
+
+	now = jiffies;
+	prev = READ_ONCE(chihiro_prev_pkt_jiffies);
+	WRITE_ONCE(chihiro_prev_pkt_jiffies, now);
+
+	/*
+	 * Power-First Smart Burst-Trigger: ignore isolated keepalives and short
+	 * background sync packets so idle/standby enters full deep sleep cleanly.
+	 * Only engage the 250ms low-latency bus guard once >=4 packets flow within
+	 * 200ms intervals (continuous gaming, voice/video call, ping, stream).
+	 */
+	if (prev != 0 && time_before(now, prev + msecs_to_jiffies(200))) {
+		unsigned int s = READ_ONCE(chihiro_net_streak) + 1;
+
+		if (s >= 3) {
+			WRITE_ONCE(chihiro_net_streak, 3);
+			WRITE_ONCE(chihiro_net_burst_until,
+				   now + msecs_to_jiffies(250));
+		} else {
+			WRITE_ONCE(chihiro_net_streak, s);
+		}
+	} else {
+		WRITE_ONCE(chihiro_net_streak, 0);
+	}
+}
+
 static int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 {
 	struct net_device *dev = skb->dev;
@@ -4133,6 +4183,7 @@ static int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	int rc = -ENOMEM;
 	bool again = false;
 
+	chihiro_mark_net_active(dev);
 	skb_reset_mac_header(skb);
 	skb_assert_len(skb);
 
@@ -4307,7 +4358,7 @@ int netdev_max_backlog __read_mostly = 1000;
 EXPORT_SYMBOL(netdev_max_backlog);
 
 int netdev_tstamp_prequeue __read_mostly = 1;
-int netdev_budget __read_mostly = 300;
+int netdev_budget __read_mostly = 600;
 /* Must be at least 2 jiffes to guarantee 1 jiffy timeout */
 unsigned int __read_mostly netdev_budget_usecs = 2 * USEC_PER_SEC / HZ;
 int weight_p __read_mostly = 64;           /* old backlog weight */
@@ -5507,6 +5558,8 @@ static void __netif_receive_skb_list_core(struct list_head *head, bool pfmemallo
 static int __netif_receive_skb(struct sk_buff *skb)
 {
 	int ret;
+
+	chihiro_mark_net_active(skb->dev);
 
 	if (sk_memalloc_socks() && skb_pfmemalloc(skb)) {
 		unsigned int noreclaim_flag;

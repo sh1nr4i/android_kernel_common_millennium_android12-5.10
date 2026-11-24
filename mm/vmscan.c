@@ -179,7 +179,7 @@ struct scan_control {
 /*
  * From 0 .. 200.  Higher means more swappy.
  */
-int vm_swappiness = 40;
+int vm_swappiness = 60;
 
 #define DEF_KSWAPD_THREADS_PER_NODE 1
 static int kswapd_threads = DEF_KSWAPD_THREADS_PER_NODE;
@@ -2366,6 +2366,8 @@ enum scan_balance {
  * nr[0] = anon inactive pages to scan; nr[1] = anon active pages to scan
  * nr[2] = file inactive pages to scan; nr[3] = file active pages to scan
  */
+extern bool chihiro_is_gaming_active(void);
+
 static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 			   unsigned long *nr)
 {
@@ -2386,6 +2388,9 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
 	}
 
 	trace_android_vh_tune_swappiness(&swappiness);
+	/* Keep balanced ZRAM compression for background apps while game RAM is protected */
+	if (chihiro_is_gaming_active() && swappiness > 60)
+		swappiness = 60;
 	/*
 	 * Global reclaim will swap to prevent OOM even with no
 	 * swappiness, but memcg users want to use this knob to

@@ -753,7 +753,28 @@ static ssize_t store_##file_name					\
 }
 
 store_one(scaling_min_freq, min);
-store_one(scaling_max_freq, max);
+
+static ssize_t store_scaling_max_freq(struct cpufreq_policy *policy,
+				      const char *buf, size_t count)
+{
+	unsigned long val;
+	int ret;
+
+	ret = sscanf(buf, "%lu", &val);
+	if (ret != 1)
+		return -EINVAL;
+
+	/*
+	 * Neutralize vendor powerhint.json INTERACTION bug that caps Little
+	 * cluster (policy0) max freq from 2.0 GHz down to 1.6 GHz on every touch.
+	 */
+	if (policy->cpu == 0 && val == 1600000UL &&
+	    policy->cpuinfo.max_freq >= 2000000U)
+		val = policy->cpuinfo.max_freq;
+
+	ret = freq_qos_update_request(policy->max_freq_req, val);
+	return ret >= 0 ? count : ret;
+}
 
 /*
  * show_cpuinfo_cur_freq - current CPU frequency as detected by hardware
@@ -2115,6 +2136,27 @@ EXPORT_SYMBOL(cpufreq_unregister_notifier);
  * If 0 is returned by the driver's ->fast_switch() callback to indicate an
  * error condition, the hardware configuration must be preserved.
  */
+extern bool chihiro_is_gaming_active(void);
+extern bool chihiro_thermal_boost_allowed(void);
+
+static inline unsigned int chihiro_apply_gaming_floor(struct cpufreq_policy *policy,
+						      unsigned int target_freq)
+{
+	/*
+	 * Adaptive gaming floor: keep clocks snappy (1.8GHz Big / 1.5GHz Little)
+	 * without burning maximum power on light 120fps lobbies, while schedutil
+	 * + UCLAMP_MIN=800 instantaneously ramps to 2.2/2.0GHz under heavy load
+	 * (HSR, teamfights) and preserves full thermal/power headroom for Mali GPU.
+	 */
+	if (chihiro_is_gaming_active() && chihiro_thermal_boost_allowed()) {
+		unsigned int floor = (policy->cpu >= 6) ? 1800000U : 1500000U;
+
+		if (target_freq < floor)
+			target_freq = floor;
+	}
+	return clamp_val(target_freq, policy->min, policy->max);
+}
+
 unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 					unsigned int target_freq)
 {
@@ -2122,7 +2164,7 @@ unsigned int cpufreq_driver_fast_switch(struct cpufreq_policy *policy,
 	unsigned int old_target_freq = target_freq;
 	int cpu;
 
-	target_freq = clamp_val(target_freq, policy->min, policy->max);
+	target_freq = chihiro_apply_gaming_floor(policy, target_freq);
 	trace_android_vh_cpufreq_fast_switch(policy, target_freq, old_target_freq);
 	freq = cpufreq_driver->fast_switch(policy, target_freq);
 
@@ -2238,8 +2280,8 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
 	if (cpufreq_disabled())
 		return -ENODEV;
 
-	/* Make sure that target_freq is within supported range */
-	target_freq = clamp_val(target_freq, policy->min, policy->max);
+	/* Make sure that target_freq is within supported range (with gaming floor) */
+	target_freq = chihiro_apply_gaming_floor(policy, target_freq);
 	trace_android_vh_cpufreq_target(policy, target_freq, old_target_freq);
 
 	pr_debug("target for CPU %u: %u kHz, relation %u, requested %u kHz\n",

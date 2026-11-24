@@ -148,6 +148,8 @@ static int mtk_otg_switch_set(struct mtk_glue *glue, enum usb_role role)
 		MUSB_DEV_MODE(musb);
 		break;
 	case USB_ROLE_NONE:
+		if (glue->role == USB_ROLE_DEVICE)
+			musb_g_disconnect(musb);
 		glue->phy_mode = PHY_MODE_USB_OTG;
 		new_role = USB_ROLE_NONE;
 		devctl &= ~MUSB_DEVCTL_SESSION;

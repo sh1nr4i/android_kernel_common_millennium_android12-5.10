@@ -222,7 +222,16 @@ static u32 pid_controller(struct thermal_zone_device *tz,
 		if (abs(i_next) < max_power_frac) {
 			i = i_next;
 			params->err_integral += err;
+			/*
+			 * Bound negative integral windup so CPU/GPU recover immediately
+			 * after heat spikes instead of stuttering in prolonged throttle.
+			 */
+			if (params->err_integral < -int_to_frac(15000))
+				params->err_integral = -int_to_frac(15000);
 		}
+	} else if (err > 0 && params->err_integral < 0) {
+		/* Rapidly bleed negative windup once below target temperature */
+		params->err_integral >>= 1;
 	}
 
 	/*
@@ -617,6 +626,8 @@ static int power_allocator_throttle(struct thermal_zone_device *tz, int trip)
 
 	ret = tz->ops->get_trip_temp(tz, params->trip_switch_on,
 				     &switch_on_temp);
+	if (!ret && !strcmp(tz->type, "soc_max") && switch_on_temp < 68000)
+		switch_on_temp = 68000;
 	if (!ret && (tz->temperature < switch_on_temp)) {
 		tz->passive = 0;
 		reset_pid_controller(params);
@@ -634,6 +645,9 @@ static int power_allocator_throttle(struct thermal_zone_device *tz, int trip)
 			 ret);
 		return ret;
 	}
+
+	if (!strcmp(tz->type, "soc_max") && control_temp < 74000)
+		control_temp = 74000;
 
 	return allocate_power(tz, control_temp);
 }

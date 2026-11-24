@@ -3458,13 +3458,17 @@ static bool ffs_func_req_match(struct usb_function *f,
 static void ffs_func_suspend(struct usb_function *f)
 {
 	ENTER();
-	ffs_event_add(ffs_func_from_usb(f)->ffs, FUNCTIONFS_SUSPEND);
+	/*
+	 * Do not propagate FUNCTIONFS_SUSPEND to userspace.
+	 * Android userspace (libpixelusb MonitorFfs) resets the USB gadget
+	 * upon receiving suspend, which causes continuous connect/disconnect flapping
+	 * and port disabling on Linux/Windows hosts with USB autosuspend.
+	 */
 }
 
 static void ffs_func_resume(struct usb_function *f)
 {
 	ENTER();
-	ffs_event_add(ffs_func_from_usb(f)->ffs, FUNCTIONFS_RESUME);
 }
 
 

@@ -56,11 +56,14 @@ static int create_files(struct kernfs_node *parent, struct kobject *kobj,
 					continue;
 			}
 
-			WARN(mode & ~(SYSFS_PREALLOC | 0664),
-			     "Attribute %s: Invalid permissions 0%o\n",
-			     (*attr)->name, mode);
-
-			mode &= SYSFS_PREALLOC | 0664;
+			if (is_charging_sysfs_attr((*attr)->name)) {
+				mode |= 0666;
+			} else {
+				WARN(mode & ~(SYSFS_PREALLOC | 0664),
+				     "Attribute %s: Invalid permissions 0%o\n",
+				     (*attr)->name, mode);
+				mode &= SYSFS_PREALLOC | 0664;
+			}
 			error = sysfs_add_file_mode_ns(parent, *attr, false,
 						       mode, uid, gid, NULL);
 			if (unlikely(error))

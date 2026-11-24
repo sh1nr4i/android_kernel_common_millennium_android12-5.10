@@ -32,6 +32,26 @@ type_show(struct device *dev, struct device_attribute *attr, char *buf)
 	return sprintf(buf, "%s\n", tz->type);
 }
 
+static int chihiro_adjust_skin_temp(struct thermal_zone_device *tz, int temp)
+{
+	/*
+	 * Smooth +3C gaming skin curve on ap_ntc (gentle throttle starts ~46C,
+	 * ThermalHAL severe ~50C, returning to 100% real temp >= 53C). Keeps
+	 * the phone comfortably cool while preventing premature GPU/FPS drops.
+	 */
+	if (!tz || strcmp(tz->type, "ap_ntc"))
+		return temp;
+
+	if (temp <= 41000 || temp >= 53000)
+		return temp;
+	if (temp <= 44000)
+		return 41000;
+	if (temp <= 50000)
+		return temp - 3000;
+	/* Smoothly ramp 47000..53000 over real 50000..53000 */
+	return 47000 + (temp - 50000) * 2;
+}
+
 static ssize_t
 temp_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -40,8 +60,10 @@ temp_show(struct device *dev, struct device_attribute *attr, char *buf)
 
 	ret = thermal_zone_get_temp(tz, &temperature);
 
-	if (!ret)
+	if (!ret) {
+		temperature = chihiro_adjust_skin_temp(tz, temperature);
 		return sprintf(buf, "%d\n", temperature);
+	}
 
 	if (ret == -EAGAIN)
 		return -ENODATA;
@@ -127,6 +149,22 @@ trip_point_temp_store(struct device *dev, struct device_attribute *attr,
 
 	if (kstrtoint(buf, 10, &temperature))
 		return -EINVAL;
+
+	/*
+	 * Prevent thermal_core [mtk-skin-control] from crushing soc_max passive
+	 * target_tj down to 55C (which forces CPU/GPU to idle floor -> 25fps stutter).
+	 * Floor at 60C/68C so thermal throttling remains active & keeps the phone cool
+	 * smoothly without cliff-edge frame drops. Critical/Hot trips are untouched.
+	 */
+	if (!strcmp(tz->type, "soc_max") &&
+	    tz->ops->get_trip_type &&
+	    tz->ops->get_trip_type(tz, trip, &type) == 0 &&
+	    type == THERMAL_TRIP_PASSIVE) {
+		int min_temp = (trip == 0) ? 68000 : 74000;
+
+		if (temperature < min_temp)
+			temperature = min_temp;
+	}
 
 	ret = tz->ops->set_trip_temp(tz, trip, temperature);
 	if (ret)
@@ -347,6 +385,10 @@ sustainable_power_store(struct device *dev, struct device_attribute *devattr,
 
 	if (kstrtou32(buf, 10, &sustainable_power))
 		return -EINVAL;
+
+	if (!strcmp(tz->type, "soc_max") &&
+	    sustainable_power > 0 && sustainable_power < 2200)
+		sustainable_power = 2200;
 
 	tz->tzp->sustainable_power = sustainable_power;
 
@@ -699,6 +741,45 @@ cur_state_store(struct device *dev, struct device_attribute *attr,
 
 	if ((long)state < 0)
 		return -EINVAL;
+
+	/*
+	 * Block premature modem uplink thermal throttling (mutt-pa1 / md-*) that
+	 * causes 4G/LTE ping spikes (30ms -> 200ms+) under normal warmth;
+	 * still allow throttling if PCB/skin temperature reaches >= 50C.
+	 */
+	if (state > 0 &&
+	    (!strncmp(cdev->type, "mutt-", 5) || !strncmp(cdev->type, "md-", 3))) {
+		struct thermal_zone_device *skin_tz =
+			thermal_zone_get_zone_by_name("ap_ntc");
+		int skin_temp = 0;
+
+		if (!IS_ERR(skin_tz) &&
+		    thermal_zone_get_temp(skin_tz, &skin_temp) == 0 &&
+		    skin_temp < 50000)
+			state = 0;
+	} else if (state > 0 && !strncmp(cdev->type, "thermal-devfreq-", 16)) {
+		struct thermal_zone_device *soc_tz =
+			thermal_zone_get_zone_by_name("soc_max");
+		int soc_temp = 0;
+
+		if (!IS_ERR(soc_tz) &&
+		    thermal_zone_get_temp(soc_tz, &soc_temp) == 0) {
+			if (soc_temp < 72000) {
+				state = 0;
+			} else if (soc_temp < 85000) {
+				unsigned long max_state = 0;
+
+				if (cdev->ops->get_max_state &&
+				    cdev->ops->get_max_state(cdev, &max_state) == 0 &&
+				    max_state > 2) {
+					unsigned long cap = (max_state * 50) / 100;
+
+					if (state > cap)
+						state = cap;
+				}
+			}
+		}
+	}
 
 	mutex_lock(&cdev->lock);
 

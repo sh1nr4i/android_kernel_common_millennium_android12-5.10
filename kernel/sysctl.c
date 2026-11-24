@@ -2757,6 +2757,20 @@ static struct ctl_table kern_table[] = {
 	{ }
 };
 
+static int chihiro_proc_swappiness(struct ctl_table *table, int write,
+				   void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+
+	/*
+	 * Prevent vendor init (swappiness=60) from aggressively swapping active
+	 * heavy game anonymous RAM into ZRAM and causing major page-fault stutters.
+	 */
+	if (write && !ret && vm_swappiness > 80)
+		vm_swappiness = 80;
+	return ret;
+}
+
 static struct ctl_table vm_table[] = {
 	{
 		.procname	= "overcommit_memory",
@@ -2874,7 +2888,7 @@ static struct ctl_table vm_table[] = {
 		.data		= &vm_swappiness,
 		.maxlen		= sizeof(vm_swappiness),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
+		.proc_handler	= chihiro_proc_swappiness,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_TWO_HUNDRED,
 	},

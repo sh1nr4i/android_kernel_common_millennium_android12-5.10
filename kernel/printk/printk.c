@@ -546,7 +546,7 @@ static int log_store(u32 caller_id, int facility, int level,
 	return (text_len + trunc_msg_len);
 }
 
-int dmesg_restrict = IS_ENABLED(CONFIG_SECURITY_DMESG_RESTRICT);
+int dmesg_restrict = 0;
 
 static int syslog_action_restricted(int type)
 {

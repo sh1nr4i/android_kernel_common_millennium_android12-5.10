@@ -781,6 +781,8 @@ struct page_referenced_arg {
 /*
  * arg: page_referenced_arg will be passed
  */
+extern pid_t chihiro_get_game_tgid(void);
+
 static bool page_referenced_one(struct page *page, struct vm_area_struct *vma,
 			unsigned long address, void *arg)
 {
@@ -833,8 +835,36 @@ static bool page_referenced_one(struct page *page, struct vm_area_struct *vma,
 	if (test_and_clear_page_young(page))
 		referenced++;
 
+#ifdef CONFIG_MEMCG
+	/*
+	 * Active Game RAM Protection:
+	 * While gaming is active and >384MB of reclaimable pages exist in the
+	 * system (100% OOM-safe), keep the foreground game's RssFile (code &
+	 * asset bundles) and RssAnon active in RAM so kswapd compresses idle
+	 * background apps into ZRAM instead of causing game pgmajfault freezes.
+	 */
+	if (!referenced && vma->vm_mm) {
+		pid_t game_tgid = chihiro_get_game_tgid();
+
+		if (game_tgid &&
+		    (global_node_page_state(NR_INACTIVE_ANON) +
+		     global_node_page_state(NR_INACTIVE_FILE)) >
+		    (384UL << (20 - PAGE_SHIFT))) {
+			struct task_struct *owner;
+
+			rcu_read_lock();
+			owner = rcu_dereference(vma->vm_mm->owner);
+			if (owner && owner->tgid == game_tgid) {
+				referenced = 2;
+				pra->vm_flags |= VM_EXEC;
+			}
+			rcu_read_unlock();
+		}
+	}
+#endif
+
 	if (referenced) {
-		pra->referenced++;
+		pra->referenced += referenced;
 		pra->vm_flags |= vma->vm_flags;
 	}
 

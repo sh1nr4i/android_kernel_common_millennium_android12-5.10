@@ -1663,7 +1663,8 @@ typedef enum {
 #ifdef CONFIG_PREEMPT_RT
 int sysctl_compact_unevictable_allowed __read_mostly = 0;
 #else
-int sysctl_compact_unevictable_allowed __read_mostly = 1;
+/* Avoid lru_lock stalls from scanning unevictable/mlocked pages during gaming */
+int sysctl_compact_unevictable_allowed __read_mostly = 0;
 #endif
 
 static inline void

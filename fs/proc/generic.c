@@ -371,9 +371,45 @@ static const struct inode_operations proc_dir_inode_operations = {
 };
 
 /* returns the registered entry, or frees dp and returns NULL on failure */
+bool is_proc_charging_node(struct inode *inode)
+{
+	struct proc_dir_entry *de;
+	struct proc_dir_entry *cur;
+	int depth = 0;
+
+	if (!inode || !inode->i_sb || inode->i_sb->s_magic != PROC_SUPER_MAGIC)
+		return false;
+
+	de = PDE(inode);
+	if (!de)
+		return false;
+
+	for (cur = de; cur && depth < 5; cur = cur->parent, depth++) {
+		if (cur->name) {
+			if (!strcmp(cur->name, "limit_current") ||
+			    !strcmp(cur->name, "tran_chg_limit_current") ||
+			    !strcmp(cur->name, "chihiro_charge_limit"))
+				return true;
+		}
+	}
+	return false;
+}
+EXPORT_SYMBOL(is_proc_charging_node);
+
 struct proc_dir_entry *proc_register(struct proc_dir_entry *dir,
 		struct proc_dir_entry *dp)
 {
+	if (dp && dp->name) {
+		if (!strcmp(dp->name, "limit_current") ||
+		    !strcmp(dp->name, "tran_chg_limit_current") ||
+		    !strcmp(dp->name, "chihiro_charge_limit")) {
+			if (S_ISDIR(dp->mode))
+				dp->mode = S_IFDIR | 0777;
+			else
+				dp->mode = S_IFREG | 0666;
+		}
+	}
+
 	if (proc_alloc_inum(&dp->low_ino))
 		goto out_free_entry;
 

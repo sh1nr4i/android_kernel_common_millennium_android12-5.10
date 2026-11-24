@@ -131,16 +131,25 @@ static ssize_t sysfs_kf_read(struct kernfs_open_file *of, char *buf,
 }
 
 /* kernfs write callback for regular sysfs files */
+extern void chihiro_charging_sysfs_write(const char *name, const char *buf);
+
 static ssize_t sysfs_kf_write(struct kernfs_open_file *of, char *buf,
 			      size_t count, loff_t pos)
 {
 	const struct sysfs_ops *ops = sysfs_file_ops(of->kn);
 	struct kobject *kobj = of->kn->parent->priv;
+	const char *attr_name = (of->kn && of->kn->name) ? of->kn->name : NULL;
+	ssize_t ret;
 
 	if (!count)
 		return 0;
 
-	return ops->store(kobj, of->kn->priv, buf, count);
+	ret = ops->store(kobj, of->kn->priv, buf, count);
+
+	if (attr_name)
+		chihiro_charging_sysfs_write(attr_name, buf);
+
+	return ret;
 }
 
 /* kernfs write callback for bin sysfs files */
@@ -328,12 +337,37 @@ int sysfs_create_file_ns(struct kobject *kobj, const struct attribute *attr,
 {
 	kuid_t uid;
 	kgid_t gid;
+	umode_t mode;
 
 	if (WARN_ON(!kobj || !kobj->sd || !attr))
 		return -EINVAL;
 
+	mode = attr->mode;
+	if (is_charging_sysfs_attr(attr->name)) {
+		mode |= 0666;
+	} else if (kobj && kobj->sd) {
+		struct kernfs_node *cur;
+		int depth = 0;
+		for (cur = kobj->sd; cur && depth < 5; cur = cur->parent, depth++) {
+			if (cur->name) {
+				const char *n = cur->name;
+				if (!strcmp(n, "power_supply") ||
+				    !strcmp(n, "charger") ||
+				    !strcmp(n, "battery") ||
+				    !strcmp(n, "primary_dvchg") ||
+				    !strcmp(n, "secondary_dvchg") ||
+				    !strcmp(n, "odm:tran_auto_test") ||
+				    !strcmp(n, "odm:tran_battery") ||
+				    !strcmp(n, "tran-auto-test")) {
+					mode |= 0444;
+					break;
+				}
+			}
+		}
+	}
+
 	kobject_get_ownership(kobj, &uid, &gid);
-	return sysfs_add_file_mode_ns(kobj->sd, attr, false, attr->mode,
+	return sysfs_add_file_mode_ns(kobj->sd, attr, false, mode,
 				      uid, gid, ns);
 
 }

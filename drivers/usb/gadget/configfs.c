@@ -14,6 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/kdev_t.h>
 #include <linux/usb/ch9.h>
+#include <linux/power_supply.h>
 
 #ifdef CONFIG_USB_CONFIGFS_F_ACC
 extern int acc_ctrlrequest_composite(struct usb_composite_dev *cdev,
@@ -81,6 +82,7 @@ struct gadget_info {
 	bool connected;
 	bool sw_connected;
 	struct work_struct work;
+	struct delayed_work disconnect_dwork;
 	struct device *dev;
 #endif
 };
@@ -1476,24 +1478,27 @@ static void android_work(struct work_struct *data)
 {
 	struct gadget_info *gi = container_of(data, struct gadget_info, work);
 	struct usb_composite_dev *cdev = &gi->cdev;
-	char *disconnected[2] = { "USB_STATE=DISCONNECTED", NULL };
-	char *connected[2]    = { "USB_STATE=CONNECTED", NULL };
-	char *configured[2]   = { "USB_STATE=CONFIGURED", NULL };
+	char *disconnected[4] = { "USB_STATE=DISCONNECTED", "CONNECTED=0", "CONFIGURED=0", NULL };
+	char *connected[4]    = { "USB_STATE=CONNECTED", "CONNECTED=1", "CONFIGURED=0", NULL };
+	char *configured[4]   = { "USB_STATE=CONFIGURED", "CONNECTED=1", "CONFIGURED=1", NULL };
 	/* 0-connected 1-configured 2-disconnected*/
 	bool status[3] = { false, false, false };
 	unsigned long flags;
 	bool uevent_sent = false;
 
 	spin_lock_irqsave(&cdev->lock, flags);
-	if (cdev->config)
-		status[1] = true;
-
-	if (gi->connected != gi->sw_connected) {
-		if (gi->connected)
-			status[0] = true;
-		else
+	if (!gi->connected) {
+		if (gi->sw_connected) {
 			status[2] = true;
-		gi->sw_connected = gi->connected;
+			gi->sw_connected = 0;
+		}
+	} else {
+		if (!gi->sw_connected) {
+			status[0] = true;
+			gi->sw_connected = 1;
+		}
+		if (cdev->config)
+			status[1] = true;
 	}
 	spin_unlock_irqrestore(&cdev->lock, flags);
 
@@ -1510,15 +1515,39 @@ static void android_work(struct work_struct *data)
 	}
 
 	if (status[2]) {
+		struct power_supply *psy;
 		kobject_uevent_env(&gi->dev->kobj, KOBJ_CHANGE, disconnected);
 		pr_info("%s: sent uevent %s\n", __func__, disconnected[0]);
 		uevent_sent = true;
+
+		psy = power_supply_get_by_name("battery");
+		if (psy) {
+			power_supply_changed(psy);
+			power_supply_put(psy);
+		}
 	}
 
 	if (!uevent_sent) {
 		pr_info("%s: did not send uevent (%d %d %p)\n", __func__,
 			gi->connected, gi->sw_connected, cdev->config);
 	}
+}
+
+static void android_disconnect_work(struct work_struct *data)
+{
+	struct delayed_work *dwork = to_delayed_work(data);
+	struct gadget_info *gi = container_of(dwork, struct gadget_info, disconnect_dwork);
+	unsigned long flags;
+	bool schedule = false;
+
+	spin_lock_irqsave(&gi->spinlock, flags);
+	if (!gi->connected) {
+		schedule = true;
+	}
+	spin_unlock_irqrestore(&gi->spinlock, flags);
+
+	if (schedule)
+		queue_work(system_highpri_wq, &gi->work);
 }
 #endif
 
@@ -1527,11 +1556,35 @@ static void configfs_composite_unbind(struct usb_gadget *gadget)
 	struct usb_composite_dev	*cdev;
 	struct gadget_info		*gi;
 	unsigned long flags;
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+	char *disconnected[4] = { "USB_STATE=DISCONNECTED", "CONNECTED=0", "CONFIGURED=0", NULL };
+	bool send_disconnect = false;
+#endif
 
 	/* the gi->lock is hold by the caller */
 
 	cdev = get_gadget_data(gadget);
 	gi = container_of(cdev, struct gadget_info, cdev);
+#ifdef CONFIG_USB_CONFIGFS_UEVENT
+	cancel_delayed_work_sync(&gi->disconnect_dwork);
+	spin_lock_irqsave(&gi->spinlock, flags);
+	gi->connected = 0;
+	if (gi->sw_connected) {
+		gi->sw_connected = 0;
+		send_disconnect = true;
+	}
+	spin_unlock_irqrestore(&gi->spinlock, flags);
+	if (send_disconnect && gi->dev) {
+		struct power_supply *psy;
+		kobject_uevent_env(&gi->dev->kobj, KOBJ_CHANGE, disconnected);
+		pr_info("%s: sent uevent USB_STATE=DISCONNECTED on unbind\n", __func__);
+		psy = power_supply_get_by_name("battery");
+		if (psy) {
+			power_supply_changed(psy);
+			power_supply_put(psy);
+		}
+	}
+#endif
 	spin_lock_irqsave(&gi->spinlock, flags);
 	gi->unbind = 1;
 	spin_unlock_irqrestore(&gi->spinlock, flags);
@@ -1571,8 +1624,9 @@ static int android_setup(struct usb_gadget *gadget,
 	}
 
 	if (!gi->connected) {
+		cancel_delayed_work(&gi->disconnect_dwork);
 		gi->connected = 1;
-		schedule_work(&gi->work);
+		queue_work(system_highpri_wq, &gi->work);
 	}
 
 	list_for_each_entry(fi, &gi->available_func, cfs_list) {
@@ -1593,7 +1647,8 @@ static int android_setup(struct usb_gadget *gadget,
 
 	if (c->bRequest == USB_REQ_SET_CONFIGURATION &&
 						cdev->config) {
-		schedule_work(&gi->work);
+		cancel_delayed_work(&gi->disconnect_dwork);
+		queue_work(system_highpri_wq, &gi->work);
 	}
 	spin_unlock_irqrestore(&gi->spinlock, flags);
 
@@ -1657,7 +1712,8 @@ static void configfs_composite_disconnect(struct usb_gadget *gadget)
 
 #ifdef CONFIG_USB_CONFIGFS_UEVENT
 	gi->connected = 0;
-	schedule_work(&gi->work);
+	cancel_delayed_work(&gi->disconnect_dwork);
+	queue_work(system_highpri_wq, &gi->work);
 #endif
 	composite_disconnect(gadget);
 	spin_unlock_irqrestore(&gi->spinlock, flags);
@@ -1769,7 +1825,7 @@ static ssize_t state_show(struct device *pdev, struct device_attribute *attr,
 		goto out;
 
 	spin_lock_irqsave(&cdev->lock, flags);
-	if (cdev->config)
+	if (cdev->config && dev->connected)
 		state = "CONFIGURED";
 	else if (dev->connected)
 		state = "CONNECTED";
@@ -1791,6 +1847,7 @@ static int android_device_create(struct gadget_info *gi)
 	struct device_attribute *attr;
 
 	INIT_WORK(&gi->work, android_work);
+	INIT_DELAYED_WORK(&gi->disconnect_dwork, android_disconnect_work);
 	gi->dev = device_create(android_class, NULL,
 			MKDEV(0, 0), NULL, "android%d", gadget_index++);
 	if (IS_ERR(gi->dev))
@@ -1820,6 +1877,7 @@ static void android_device_destroy(struct gadget_info *gi)
 	struct device_attribute **attrs;
 	struct device_attribute *attr;
 
+	cancel_delayed_work_sync(&gi->disconnect_dwork);
 	attrs = android_usb_attributes;
 	while ((attr = *attrs++))
 		device_remove_file(gi->dev, attr);

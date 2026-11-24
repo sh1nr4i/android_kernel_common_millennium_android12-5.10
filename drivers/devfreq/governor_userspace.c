@@ -13,12 +13,93 @@
 #include <linux/pm.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
+#include <linux/string.h>
+#include <linux/workqueue.h>
+#include <linux/thermal.h>
 #include "governor.h"
+
+extern bool chihiro_is_gaming_active(void);
 
 struct userspace_data {
 	unsigned long user_frequency;
 	bool valid;
 };
+
+static DEFINE_MUTEX(chihiro_dvfsrc_lock);
+static struct devfreq *chihiro_dvfsrc_df;
+static struct delayed_work chihiro_dvfsrc_monitor_work;
+static bool chihiro_dvfsrc_work_init;
+static bool chihiro_dvfsrc_boosted;
+static bool chihiro_soc_cool = true;
+
+bool chihiro_thermal_boost_allowed(void)
+{
+	return READ_ONCE(chihiro_soc_cool);
+}
+
+static bool chihiro_dvfsrc_thermal_ok(void)
+{
+	struct thermal_zone_device *soc_tz =
+		thermal_zone_get_zone_by_name("soc_max");
+	int temp = 0;
+	bool ok = true;
+
+	if (!IS_ERR(soc_tz) && thermal_zone_get_temp(soc_tz, &temp) == 0 &&
+	    temp >= 82000)
+		ok = false;
+	WRITE_ONCE(chihiro_soc_cool, ok);
+	return ok;
+}
+
+static void chihiro_dvfsrc_monitor_workfn(struct work_struct *work)
+{
+	struct devfreq *df;
+	bool want_boost;
+
+	mutex_lock(&chihiro_dvfsrc_lock);
+	df = chihiro_dvfsrc_df;
+	if (!df) {
+		mutex_unlock(&chihiro_dvfsrc_lock);
+		return;
+	}
+
+	want_boost = chihiro_is_gaming_active() && chihiro_dvfsrc_thermal_ok();
+
+	if (want_boost) {
+		mutex_lock(&df->lock);
+		if (df->data) {
+			struct userspace_data *data = df->data;
+
+			if (!chihiro_dvfsrc_boosted ||
+			    data->user_frequency != 4266000000UL) {
+				data->user_frequency = 4266000000UL;
+				data->valid = true;
+				update_devfreq(df);
+				chihiro_dvfsrc_boosted = true;
+			}
+		}
+		mutex_unlock(&df->lock);
+	} else if (chihiro_dvfsrc_boosted) {
+		mutex_lock(&df->lock);
+		if (df->data) {
+			struct userspace_data *data = df->data;
+
+			if (data->user_frequency == 4266000000UL) {
+				data->user_frequency = 0;
+				data->valid = true;
+				update_devfreq(df);
+			}
+		}
+		mutex_unlock(&df->lock);
+		chihiro_dvfsrc_boosted = false;
+	}
+
+	queue_delayed_work(system_power_efficient_wq,
+			   &chihiro_dvfsrc_monitor_work,
+			   msecs_to_jiffies((want_boost || chihiro_dvfsrc_boosted) ?
+					    1000 : 15000));
+	mutex_unlock(&chihiro_dvfsrc_lock);
+}
 
 static int devfreq_userspace_func(struct devfreq *df, unsigned long *freq)
 {
@@ -43,6 +124,17 @@ static ssize_t store_freq(struct device *dev, struct device_attribute *attr,
 	err = kstrtoul(buf, 0, &wanted);
 	if (err)
 		return err;
+
+	/*
+	 * Keep LPDDR4X DRAM at 4266 MHz during active gameplay (SoC < 82C),
+	 * overriding PowerHAL's 4-second reset to 0.
+	 */
+	if (wanted == 0 && dev_name(&devfreq->dev) &&
+	    strstr(dev_name(&devfreq->dev), "dvfsrc") &&
+	    chihiro_is_gaming_active() && chihiro_dvfsrc_thermal_ok()) {
+		wanted = 4266000000UL;
+		chihiro_dvfsrc_boosted = true;
+	}
 
 	mutex_lock(&devfreq->lock);
 	data = devfreq->data;
@@ -98,12 +190,35 @@ static int userspace_init(struct devfreq *devfreq)
 	devfreq->data = data;
 
 	err = sysfs_create_group(&devfreq->dev.kobj, &dev_attr_group);
+	if (!err && dev_name(&devfreq->dev) &&
+	    strstr(dev_name(&devfreq->dev), "dvfsrc")) {
+		mutex_lock(&chihiro_dvfsrc_lock);
+		chihiro_dvfsrc_df = devfreq;
+		if (!chihiro_dvfsrc_work_init) {
+			INIT_DEFERRABLE_WORK(&chihiro_dvfsrc_monitor_work,
+					     chihiro_dvfsrc_monitor_workfn);
+			chihiro_dvfsrc_work_init = true;
+		}
+		queue_delayed_work(system_power_efficient_wq,
+				   &chihiro_dvfsrc_monitor_work,
+				   msecs_to_jiffies(15000));
+		mutex_unlock(&chihiro_dvfsrc_lock);
+	}
 out:
 	return err;
 }
 
 static void userspace_exit(struct devfreq *devfreq)
 {
+	mutex_lock(&chihiro_dvfsrc_lock);
+	if (chihiro_dvfsrc_df == devfreq) {
+		chihiro_dvfsrc_df = NULL;
+		chihiro_dvfsrc_boosted = false;
+		if (chihiro_dvfsrc_work_init)
+			cancel_delayed_work(&chihiro_dvfsrc_monitor_work);
+	}
+	mutex_unlock(&chihiro_dvfsrc_lock);
+
 	/*
 	 * Remove the sysfs entry, unless this is being called after
 	 * device_del(), which should have done this already via kobject_del().
